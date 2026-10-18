@@ -1,0 +1,33 @@
+# Cloudflare Zero Trust Tunnel Configuration (100% Free Tier)
+# Connects TheySynced Axum backend securely to Cloudflare Edge Network
+
+tunnel: theysynced-tunnel
+credentials-file: /etc/cloudflared/theysynced-tunnel.json
+
+ingress:
+  # 1. Axum Real-time WebSocket Hub
+  - hostname: api.yourdomain.com
+    path: /ws/*
+    service: http://127.0.0.1:8000
+    originRequest:
+      noTLSVerify: true
+
+  # 2. WebRDP Remote Desktop WebSocket Bridge
+  - hostname: api.yourdomain.com
+    path: /rdp-ws/*
+    service: http://127.0.0.1:8000
+    originRequest:
+      noTLSVerify: true
+
+  # 3. Axum REST API Routes
+  - hostname: api.yourdomain.com
+    service: http://127.0.0.1:8000
+    originRequest:
+      noTLSVerify: true
+
+  # 4. Next.js Frontend
+  - hostname: app.yourdomain.com
+    service: http://127.0.0.1:3000
+
+  # 5. Fallback 404 rule
+  - service: http_status:404

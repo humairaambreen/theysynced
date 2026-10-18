@@ -1,0 +1,7 @@
+{
+  "framework": "nextjs",
+  "buildCommand": "next build",
+  "installCommand": "npm install",
+  "outputDirectory": ".next",
+  "ignoreCommand": "git diff --quiet HEAD^ HEAD -- . ':(exclude)target' ':(exclude)*.log' ':(exclude)src'"
+}

@@ -1,0 +1,50 @@
+{
+  "name": "theysynced",
+  "private": true,
+  "version": "0.2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k -p \"[{name}]\" -n \"Rust-Backend,Next-Frontend,RDP-Proxy\" -c \"cyan,magenta,yellow\" \"cargo run\" \"next dev -p 3000\" \"node ./scripts/server-rdp.cjs\"",
+    "dev:frontend": "next dev -p 3000",
+    "dev:backend": "cargo run",
+    "dev:rdp": "node ./scripts/server-rdp.cjs",
+    "build": "next build --webpack",
+    "build:export": "OUTPUT_EXPORT=true next build",
+    "start": "next start -p 3000",
+    "deploy:cloudflare": "npm run build:export && wrangler deploy",
+    "tunnel:quick": "./tunnel/start-quick-tunnel.sh",
+    "d1:migrate": "wrangler d1 execute theysynced-db --file=./migrations/0001_init.sql"
+  },
+  "dependencies": {
+    "@excalidraw/excalidraw": "^0.18.1",
+    "@outpacelabs/avatars": "^0.4.0",
+    "@tiptap/react": "^3.28.0",
+    "@tiptap/starter-kit": "^3.28.0",
+    "clsx": "^2.1.1",
+    "express": "^4.21.0",
+    "express-ws": "^5.0.2",
+    "fuse.js": "^7.5.0",
+    "gsap": "^3.15.0",
+    "iconoir-react": "^7.11.1",
+    "idb": "^8.0.3",
+    "jspreadsheet-ce": "^5.0.4",
+    "jsuites": "^6.4.2",
+    "lucide-react": "^0.469.0",
+    "next": "^16.2.11",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tailwind-merge": "^2.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "autoprefixer": "^10.4.20",
+    "concurrently": "^9.1.2",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.17",
+    "turbo": "^2.6.0",
+    "typescript": "^5.7.2",
+    "wrangler": "^4.151.1"
+  }
+}

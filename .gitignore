@@ -1,0 +1,93 @@
+# ─── Rust ─────────────────────────────────────────────────────────────────────
+/target/
+**/*.rs.bk
+*.pdb
+# Keep Cargo.lock for reproducible builds (binary project)
+# Cargo.lock
+
+# ─── Next.js / Node ───────────────────────────────────────────────────────────
+node_modules/
+.next/
+out/
+dist/
+build/
+
+# Compiled static assets (auto-generated)
+/static/assets/
+
+# Next.js build artifacts
+tsconfig.tsbuildinfo
+next-env.d.ts
+
+# Package manager lock files (keep pnpm-lock.yaml, drop others)
+package-lock.json
+yarn.lock
+# pnpm-lock.yaml  ← keep this
+
+# ─── Environment & Secrets ────────────────────────────────────────────────────
+.env
+.env.local
+.env.production
+.env.test
+.env.*.local
+api-secrets.txt
+secrets.txt
+*.key
+*.pem
+*.cert
+
+# ─── Database & Data Files ────────────────────────────────────────────────────
+# The live DB file — too large and machine-specific for git
+theysynced_db.json
+*.db
+*.sqlite
+*.sqlite3
+
+# Tantivy search index (auto-regenerated on startup)
+/index/
+
+# ─── OS & System ──────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# ─── IDE & Editors ────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.iml
+
+# ─── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+debug.log
+error.log
+
+# ─── Temp & Cache ─────────────────────────────────────────────────────────────
+*.tmp
+*.temp
+*.bak
+*.backup
+.cache/
+*.cache
+
+# ─── Scripts & Dev Tools ──────────────────────────────────────────────────────
+# One-off helper scripts not needed in production
+print_first_lines.py
+brain/
+
+# ─── Docker (keep Dockerfile/compose, ignore generated volumes) ───────────────
+# Dockerfile and docker-compose.yml are committed
+.vercel
+.wrangler/
+scratch/
+theysynced_*.db*

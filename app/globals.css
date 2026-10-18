@@ -1,0 +1,61 @@
+@import "tailwindcss/base";
+@import "tailwindcss/components";
+@import "tailwindcss/utilities";
+
+body {
+  font-family: 'Satoshi', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  background-color: #F8F9FB;
+  color: #111827;
+}
+
+.squircle-card {
+  border-radius: 40px;
+  background: #ffffff;
+  border: 1px solid rgba(0, 0, 0, 0.05);
+  box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.04);
+  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.squircle-card:hover {
+  box-shadow: 0 20px 45px -15px rgba(0, 0, 0, 0.08);
+  transform: translateY(-2px);
+}
+
+.squircle-olive {
+  border-radius: 44px;
+  background: #7F7149;
+  color: #FFFFFF;
+}
+
+.squircle-periwinkle {
+  border-radius: 48px;
+  background: #E0E3FF;
+  color: #111827;
+}
+
+.squircle-beige {
+  border-radius: 40px;
+  background: #F4F2EC;
+  color: #111827;
+}
+
+.pill-btn {
+  border-radius: 9999px;
+  transition: all 0.2s ease;
+}
+
+.pill-btn:hover {
+  transform: scale(1.02);
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.15);
+  border-radius: 9999px;
+}
