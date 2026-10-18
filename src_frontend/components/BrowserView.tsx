@@ -21,7 +21,7 @@ interface BookmarkItem {
 }
 
 const DEFAULT_BOOKMARKS: BookmarkItem[] = [
-  { id: 'b-google', title: 'Google Search', url: 'https://www.google.com' },
+  { id: 'b-google', title: 'Google Search', url: 'https://www.google.com/search?igu=1' },
   { id: 'b-ddg', title: 'DuckDuckGo', url: 'https://html.duckduckgo.com' },
   { id: 'b-wiki', title: 'Wikipedia', url: 'https://en.m.wikipedia.org' },
   { id: 'b-hn', title: 'Hacker News', url: 'https://news.ycombinator.com' },
@@ -32,7 +32,7 @@ const DEFAULT_BOOKMARKS: BookmarkItem[] = [
 export const BrowserView: React.FC<BrowserViewProps> = ({
   user,
   company,
-  initialUrl = 'https://www.google.com',
+  initialUrl = 'https://www.google.com/search?igu=1',
   onNavigateTab,
 }) => {
   const [urlInput, setUrlInput] = useState(initialUrl);
@@ -56,7 +56,10 @@ export const BrowserView: React.FC<BrowserViewProps> = ({
   // Normalize URL or Search Query
   const normalizeUrl = (input: string): string => {
     let trimmed = input.trim();
-    if (!trimmed) return 'https://www.google.com';
+    if (!trimmed) return 'https://www.google.com/search?igu=1';
+    if (trimmed === 'google' || trimmed === 'google.com' || trimmed === 'https://google.com' || trimmed === 'https://www.google.com') {
+      return 'https://www.google.com/search?igu=1';
+    }
     if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
       return trimmed;
     }
@@ -64,14 +67,17 @@ export const BrowserView: React.FC<BrowserViewProps> = ({
     if (trimmed.includes('.') && !trimmed.includes(' ')) {
       return `https://${trimmed}`;
     }
-    // Otherwise treat as search query (Sandboxed privacy search)
-    return `https://html.duckduckgo.com/html/?q=${encodeURIComponent(trimmed)}`;
+    // Search query via Google igu=1 (bypasses frame restrictions natively)
+    return `https://www.google.com/search?igu=1&q=${encodeURIComponent(trimmed)}`;
   };
 
-  // Build sandboxed proxy URL (bypasses X-Frame-Options & protects personal IP)
-  const getProxiedUrl = (target: string): string => {
-    if (!target) return '';
-    return `/api/browser/proxy?url=${encodeURIComponent(target)}`;
+  // Get target URL for the iframe: Google igu=1 loads natively, others load directly
+  const getIframeUrl = (target: string): string => {
+    if (!target) return 'https://www.google.com/search?igu=1';
+    if (target.includes('google.com') && !target.includes('igu=1')) {
+      return target.includes('?') ? `${target}&igu=1` : `${target}?igu=1`;
+    }
+    return target;
   };
 
   // Navigate to Target URL
@@ -117,10 +123,10 @@ export const BrowserView: React.FC<BrowserViewProps> = ({
     setLoadError(false);
     if (iframeRef.current) {
       try {
-        iframeRef.current.src = getProxiedUrl(currentUrl);
+        iframeRef.current.src = getIframeUrl(currentUrl);
       } catch (_) {}
     }
-    setTimeout(() => setIsLoading(false), 1200);
+    setTimeout(() => setIsLoading(false), 800);
   };
 
   const handleGoHome = () => {
@@ -305,10 +311,10 @@ export const BrowserView: React.FC<BrowserViewProps> = ({
           </div>
         )}
 
-        {/* Sandboxed Web Viewport Frame (Routes through /api/browser/proxy to bypass X-Frame-Options) */}
+        {/* Sandboxed Web Viewport Frame */}
         <iframe
           ref={iframeRef}
-          src={getProxiedUrl(currentUrl)}
+          src={getIframeUrl(currentUrl)}
           onLoad={() => setIsLoading(false)}
           onError={() => {
             setIsLoading(false);
@@ -316,7 +322,7 @@ export const BrowserView: React.FC<BrowserViewProps> = ({
           }}
           className="w-full flex-1 border-0 bg-white"
           sandbox="allow-same-origin allow-scripts allow-popups allow-forms allow-modals allow-downloads"
-          title="TheySynced Sandboxed OS Web Browser"
+          title="TheySynced In-System Web Browser"
         />
 
         {/* Error Fallback */}
