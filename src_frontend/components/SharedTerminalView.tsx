@@ -5,9 +5,10 @@ import { Company, Team, ChatMessage, UserProfile, WorkspaceAsset, ActiveTab } fr
 import { 
   Terminal as TerminalIcon, Cpu, Trash2, FolderGit2, Save, X, 
   Table, PenTool, FileText, MessageSquare, Download, CheckCircle, 
-  ExternalLink, HardDrive
+  ExternalLink, HardDrive, ShieldAlert, ShieldCheck
 } from 'lucide-react';
 import { buildCompanyLinuxFilesystem, LinuxFileEntry } from '../lib/linuxFilesystem';
+import { LinuxVirtualKernel, ShellExecResult } from '../lib/linuxVirtualKernel';
 
 interface SharedTerminalViewProps {
   user: UserProfile;
@@ -59,16 +60,32 @@ export const SharedTerminalView: React.FC<SharedTerminalViewProps> = ({
     );
   }, [company.owner_id, company.members, user.id]);
 
-  // Working Directory
+  // Working Directory & Prompt State
   const [cwd, setCwd] = useState<string>(initialPath || '/workspace');
   const [inputVal, setInputVal] = useState<string>('');
   const [history, setHistory] = useState<string[]>([]);
   const [historyIndex, setHistoryIndex] = useState<number>(-1);
 
-  // Pyodide POSIX Engine State
-  const [isPyodideLoading, setIsPyodideLoading] = useState<boolean>(false);
-  const [isPyodideReady, setIsPyodideReady] = useState<boolean>(false);
+  // Privileges State: normal user ($) vs root superuser (#)
+  const [isRoot, setIsRoot] = useState<boolean>(false);
+
+  // Installed Packages State (Shared across company via D1 asset)
+  const [installedPackages, setInstalledPackages] = useState<string[]>(() => {
+    const pkgAsset = assets.find((a) => a.id === `linux_packages_${company.id}`);
+    if (pkgAsset && pkgAsset.content) {
+      try {
+        const parsed = JSON.parse(pkgAsset.content);
+        if (Array.isArray(parsed)) return parsed;
+      } catch (_) {}
+    }
+    // Default initial packages: Python is NOT pre-installed! Clean Linux system!
+    return ['base-files', 'coreutils', 'bash'];
+  });
+
+  // Interactive REPL States
   const [isPythonRepl, setIsPythonRepl] = useState<boolean>(false);
+  const [isNodeRepl, setIsNodeRepl] = useState<boolean>(false);
+  const [isPyodideLoading, setIsPyodideLoading] = useState<boolean>(false);
 
   // In-Terminal Text Editor (nano) State
   const [nanoActive, setNanoActive] = useState<boolean>(false);
@@ -77,6 +94,7 @@ export const SharedTerminalView: React.FC<SharedTerminalViewProps> = ({
   const [nanoModified, setNanoModified] = useState<boolean>(false);
 
   const pyodideRef = useRef<any>(null);
+  const kernelRef = useRef<LinuxVirtualKernel | null>(null);
   const terminalEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const nanoTextareaRef = useRef<HTMLTextAreaElement>(null);
@@ -86,13 +104,52 @@ export const SharedTerminalView: React.FC<SharedTerminalViewProps> = ({
     return buildCompanyLinuxFilesystem(company, teams, chatMessages, assets, user);
   }, [company, teams, chatMessages, assets, user]);
 
+  // Initialize or re-sync Virtual Linux Kernel
+  useEffect(() => {
+    const kernel = new LinuxVirtualKernel(company.name, company.id, hostname, installedPackages);
+    kernel.mountCompanyFiles(linuxEntries, user.username);
+    kernelRef.current = kernel;
+  }, [company.name, company.id, hostname, linuxEntries, user.username, installedPackages]);
+
+  // Sync installed packages if updated in assets
+  useEffect(() => {
+    const pkgAsset = assets.find((a) => a.id === `linux_packages_${company.id}`);
+    if (pkgAsset && pkgAsset.content) {
+      try {
+        const parsed = JSON.parse(pkgAsset.content);
+        if (Array.isArray(parsed)) {
+          setInstalledPackages(parsed);
+          if (kernelRef.current) kernelRef.current.setInstalledPackages(parsed);
+        }
+      } catch (_) {}
+    }
+  }, [assets, company.id]);
+
+  // Persist installed packages to company shared asset
+  const saveInstalledPackages = async (pkgs: string[]) => {
+    setInstalledPackages(pkgs);
+    if (kernelRef.current) kernelRef.current.setInstalledPackages(pkgs);
+    await onSaveAsset({
+      id: `linux_packages_${company.id}`,
+      company_id: company.id,
+      asset_type: 'file',
+      name: 'installed_packages.json',
+      folder_path: '/var/lib/dpkg',
+      content: JSON.stringify(pkgs, null, 2),
+      size: JSON.stringify(pkgs).length,
+      created_by: 'system',
+      updated_at: new Date().toISOString(),
+      scope: 'shared',
+    });
+  };
+
   // Initial Welcome MOTD
   const initialLogs: TerminalLog[] = useMemo(() => [
     {
       id: 'init_1',
       user: 'system',
       type: 'system',
-      text: `Welcome to TheySynced Enterprise Linux OS 6.8.0-wasm (GNU/Linux x86_64)
+      text: `Welcome to TheySynced Enterprise Linux OS (GNU/Linux x86_64)
   * Organization: ${company.name} [ID: ${company.id}]
   * Hostname:     ${hostname}
   * File System:  100% Unified Work OS mounted at /workspace
@@ -100,15 +157,16 @@ export const SharedTerminalView: React.FC<SharedTerminalViewProps> = ({
                   - /workspace/spreadsheets/ (Financial sheets & CSV tables)
                   - /workspace/drawings/     (Excalidraw architecture canvases)
                   - /workspace/docs/         (Knowledgebase documents & Markdown)
+                  - /workspace/tasks/        (Jira Kanban board & task issues)
                   - /workspace/files/        (Uploaded files, media, and scripts)
                   - /workspace/export/       (Encrypted backups and tarball dumps)
                   - /etc/theysynced/         (Organization configuration & roster)
-  * Visualizers:  Theysynced tabs visualize these exact Linux files in real time.
-                  Type "open <file>" or click "GUI File Manager" to open them.
-  * Automation:   Type "export-org" to generate a complete encrypted organization backup.
-  * Python:       Python 3.12 WebAssembly (Pyodide) available with pip install.
+  * Package Mgr:  APT & Homebrew ready. Use 'sudo apt install <pkg>' or 'brew install <pkg>'
+  * Python:       Not installed. (Run 'sudo apt install python3' or 'brew install python')
+  * Security:     Type 'sudo su' to enter root mode, or prefix commands with 'sudo'
+  * Visualizers:  Type 'open <file>' to visualize, or 'gui' to open Nautilus GUI.
 
-Type "help" for command manual, "open <file>" to visualize, or "gui" to open Nautilus GUI.`,
+Type "help" for command manual, "apt list" for available packages, or "brew doctor".`,
       timestamp: new Date().toISOString(),
     },
   ], [company.name, company.id, hostname]);
@@ -191,795 +249,52 @@ Type "help" for command manual, "open <file>" to visualize, or "gui" to open Nau
     }
   };
 
-  // Sync entire company Linux filesystem into Pyodide's real POSIX FS
-  const syncCompanyFilesToPyodide = (pyodide: any) => {
-    if (!pyodide || !pyodide.FS) return;
-    try {
-      const dirs = [
-        '/workspace',
-        '/workspace/chats',
-        '/workspace/spreadsheets',
-        '/workspace/drawings',
-        '/workspace/docs',
-        '/workspace/files',
-        '/workspace/tasks',
-        '/workspace/export',
-        '/etc',
-        '/etc/theysynced',
-        '/home',
-        `/home/${user.username}`,
-        '/tmp',
-        '/bin',
-      ];
-
-      dirs.forEach((d) => {
-        try { pyodide.FS.mkdirTree(d); } catch (_) {}
-      });
-
-      // Write all Linux files into Pyodide virtual disk
-      linuxEntries.forEach((entry) => {
-        if (entry.type === 'file' && entry.content !== undefined) {
-          try {
-            pyodide.FS.writeFile(entry.path, entry.content);
-          } catch (_) {}
-        }
-      });
-    } catch (_) {}
-  };
-
-  // Sync any newly written or modified files from Pyodide back to D1 assets
-  const syncPyodideChangesBackToAssets = async (pyodide: any) => {
-    if (!pyodide || !pyodide.FS) return;
-    try {
-      const scanDir = async (dirPath: string) => {
-        try {
-          const items: string[] = pyodide.FS.readdir(dirPath);
-          for (const item of items) {
-            if (item === '.' || item === '..') continue;
-            const fullPath = `${dirPath}/${item}`.replace(/\/+/g, '/');
-            try {
-              const stat = pyodide.FS.stat(fullPath);
-              if (pyodide.FS.isDir(stat.mode)) {
-                await scanDir(fullPath);
-              } else {
-                // Check if this file is newly created or updated in /workspace
-                if (fullPath.startsWith('/workspace')) {
-                  const existing = assets.find((a) => a.name === item);
-                  const content = pyodide.FS.readFile(fullPath, { encoding: 'utf8' });
-                  if (!existing || existing.content !== content) {
-                    await onSaveAsset({
-                      id: existing?.id || `file_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
-                      company_id: company.id,
-                      asset_type: item.endsWith('.sheet.json') ? 'spreadsheet' : item.endsWith('.excalidraw.json') ? 'whiteboard' : item.endsWith('.doc.json') || item.endsWith('.md') ? 'doc' : 'file',
-                      name: item,
-                      content: content,
-                      size: content.length,
-                      folder_path: dirPath,
-                      created_by: user.username,
-                      updated_at: new Date().toISOString(),
-                      scope: 'shared',
-                    });
-                  }
-                }
-              }
-            } catch (_) {}
-          }
-        } catch (_) {}
-      };
-
-      await scanDir('/workspace');
-    } catch (_) {}
-  };
-
-  // Initialize Pyodide WebAssembly Linux & Python Engine
-  const initPyodide = async (): Promise<any> => {
+  // Dynamic on-demand Pyodide loader (ONLY loads when python3 or pip is called AFTER install)
+  const initPyodide = async () => {
     if (pyodideRef.current) return pyodideRef.current;
     if (isPyodideLoading) return null;
 
     setIsPyodideLoading(true);
     appendLog({
-      id: `sys_${Date.now()}`,
+      id: `sys_load_${Date.now()}`,
       user: 'system',
       type: 'system',
-      text: '⚡ Booting WebAssembly POSIX Linux Subsystem (Pyodide CPython 3.12)...',
+      text: 'Loading CPython 3.12 WebAssembly runtime...',
       timestamp: new Date().toISOString(),
     });
 
     try {
-      if (!(window as any).loadPyodide) {
-        await new Promise((resolve, reject) => {
+      if (typeof window !== 'undefined' && !(window as any).loadPyodide) {
+        await new Promise<void>((resolve, reject) => {
           const script = document.createElement('script');
-          script.src = 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js';
-          script.onload = resolve;
-          script.onerror = reject;
+          script.src = 'https://cdn.jsdelivr.net/pyodide/v0.26.2/full/pyodide.js';
+          script.async = true;
+          script.onload = () => resolve();
+          script.onerror = () => reject(new Error('Failed to load Pyodide WebAssembly script'));
           document.head.appendChild(script);
         });
       }
 
-      const pyodide = await (window as any).loadPyodide({
-        stdout: (text: string) => {
-          appendLog({
-            id: `out_${Date.now()}_${Math.random()}`,
-            user: user.username,
-            type: 'output',
-            text,
-            timestamp: new Date().toISOString(),
-          });
-        },
-        stderr: (text: string) => {
-          appendLog({
-            id: `err_${Date.now()}_${Math.random()}`,
-            user: user.username,
-            type: 'error',
-            text,
-            timestamp: new Date().toISOString(),
-          });
-        },
+      const loadPyodideFn = (window as any).loadPyodide;
+      if (!loadPyodideFn) throw new Error('loadPyodide not found');
+
+      const pyodide = await loadPyodideFn({
+        indexURL: 'https://cdn.jsdelivr.net/pyodide/v0.26.2/full/',
       });
 
       // Load micropip for pip package installation
-      await pyodide.loadPackage('micropip');
-      syncCompanyFilesToPyodide(pyodide);
-
-      // Load the POSIX Linux Engine Python script into Pyodide
-      await pyodide.runPythonAsync(`
-import os, sys, shutil, glob, shlex, re, json, csv, tarfile, zipfile, io, datetime, hashlib, fnmatch, math
-
-os.environ['USER'] = '${user.username}'
-os.environ['HOSTNAME'] = '${hostname}'
-os.environ['HOME'] = '/home/${user.username}'
-os.environ['PWD'] = '/workspace'
-os.environ['PATH'] = '/bin:/usr/bin:/workspace'
-os.environ['SHELL'] = '/bin/bash'
-os.environ['COMPANY_ID'] = '${company.id}'
-os.environ['COMPANY_NAME'] = '${company.name}'
-
-os.chdir('/workspace')
-
-def check_permission(path, username, is_admin):
-    if is_admin:
-        return True, ""
-    norm = os.path.normpath(path).lower()
-    user_low = username.lower()
-
-    # 1. Other users' home directories (/home/<other>)
-    if norm.startswith('/home/') and not norm.startswith(f'/home/{user_low}'):
-        return False, f"bash: {path}: Permission denied (Private user home directory)"
-
-    # 2. Direct message chat logs (/workspace/chats/dm_... or dm-...)
-    if ('/workspace/chats/' in norm or norm.startswith('dm_') or norm.startswith('dm-')) and ('dm_' in norm or 'dm-' in norm):
-        fname = os.path.basename(norm)
-        if user_low not in fname:
-            return False, f"bash: {path}: Permission denied (Private direct message conversation)"
-
-    return True, ""
-
-def posix_shell_execute(cmd_line, current_cwd, username, hostname, is_admin=False):
-    import os, sys, shutil, glob, shlex, re, json, csv, tarfile, zipfile, io, datetime, fnmatch
-
-    cmd_line = cmd_line.strip()
-    if not cmd_line:
-        return {"output": "", "error": "", "new_cwd": current_cwd, "open_tab": None, "open_id": None}
-
-    # Change into current working directory
-    try:
-        os.chdir(current_cwd)
-    except Exception:
-        os.chdir('/workspace')
-        current_cwd = '/workspace'
-
-    # Environment variable replacement: $VAR
-    def replace_env(match):
-        var_name = match.group(1)
-        return os.environ.get(var_name, '')
-    cmd_line = re.sub(r'\\$([A-Za-z0-9_]+)', replace_env, cmd_line)
-
-    # Output Redirection: > and >>
-    redir_file = None
-    redir_append = False
-    if '>>' in cmd_line:
-        parts = cmd_line.split('>>', 1)
-        cmd_line = parts[0].strip()
-        redir_file = parts[1].strip().strip('"').strip("'")
-        redir_append = True
-    elif '>' in cmd_line:
-        parts = cmd_line.split('>', 1)
-        cmd_line = parts[0].strip()
-        redir_file = parts[1].strip().strip('"').strip("'")
-        redir_append = False
-
-    # Pipeline handling: |
-    if '|' in cmd_line:
-        pipe_stages = [s.strip() for s in cmd_line.split('|')]
-        pipe_input = ""
-        for stage in pipe_stages:
-            res = posix_shell_single(stage, os.getcwd(), username, hostname, pipe_input, is_admin)
-            pipe_input = res.get("output", "")
-            if res.get("error"):
-                return {"output": "", "error": res["error"], "new_cwd": os.getcwd(), "open_tab": None, "open_id": None}
-        
-        final_out = pipe_input
-        if redir_file:
-            allowed, p_err = check_permission(redir_file, username, is_admin)
-            if not allowed:
-                return {"output": "", "error": p_err, "new_cwd": os.getcwd(), "open_tab": None, "open_id": None}
-            mode = 'a' if redir_append else 'w'
-            with open(redir_file, mode) as f:
-                f.write(final_out if final_out.endswith('\\n') else final_out + '\\n')
-            return {"output": f"Written to {redir_file}", "error": "", "new_cwd": os.getcwd(), "open_tab": None, "open_id": None}
-        return {"output": final_out, "error": "", "new_cwd": os.getcwd(), "open_tab": None, "open_id": None}
-
-    # Single command
-    res = posix_shell_single(cmd_line, os.getcwd(), username, hostname, "", is_admin)
-    out = res.get("output", "")
-
-    if redir_file and out:
-        allowed, p_err = check_permission(redir_file, username, is_admin)
-        if not allowed:
-            return {"output": "", "error": p_err, "new_cwd": os.getcwd(), "open_tab": None, "open_id": None}
-        mode = 'a' if redir_append else 'w'
-        with open(redir_file, mode) as f:
-            f.write(out if out.endswith('\\n') else out + '\\n')
-        res["output"] = f"Written {len(out)} bytes to {redir_file}"
-
-    return res
-
-def posix_shell_single(cmd_str, cwd, username, hostname, stdin_data="", is_admin=False):
-    import os, sys, shutil, glob, shlex, re, json, csv, tarfile, zipfile, io, datetime, fnmatch
-
-    try:
-        tokens = shlex.split(cmd_str)
-    except Exception as e:
-        return {"output": "", "error": f"bash: parse error: {e}", "new_cwd": cwd}
-
-    if not tokens:
-        return {"output": "", "error": "", "new_cwd": cwd}
-
-    cmd = tokens[0].lower()
-    args = tokens[1:]
-
-    # 1. PWD
-    if cmd == 'pwd':
-        return {"output": os.getcwd(), "error": "", "new_cwd": os.getcwd()}
-
-    # 2. CD
-    if cmd == 'cd':
-        target = args[0] if args else '/workspace'
-        if target == '~':
-            target = f'/home/{username}'
-        allowed, p_err = check_permission(target, username, is_admin)
-        if not allowed:
-            return {"output": "", "error": p_err, "new_cwd": cwd}
-        try:
-            os.chdir(target)
-            new_path = os.getcwd()
-            os.environ['PWD'] = new_path
-            return {"output": "", "error": "", "new_cwd": new_path}
-        except Exception as e:
-            return {"output": "", "error": f"bash: cd: {target}: No such file or directory", "new_cwd": cwd}
-
-    # 3. LS
-    if cmd in ['ls', 'dir']:
-        is_long = any(a in args for a in ['-l', '-la', '-al', '-lh', '-hl'])
-        show_all = any(a in args for a in ['-a', '-la', '-al'])
-        targets = [a for a in args if not a.startswith('-')]
-        target_dir = targets[0] if targets else '.'
-
-        allowed, p_err = check_permission(target_dir, username, is_admin)
-        if not allowed:
-            return {"output": "", "error": p_err, "new_cwd": cwd}
-
-        try:
-            entries = os.listdir(target_dir)
-            if not is_admin:
-                target_abs = os.path.abspath(target_dir).lower()
-                if target_abs == '/home':
-                    entries = [e for e in entries if e.lower() == username.lower()]
-                elif 'chats' in target_abs:
-                    entries = [e for e in entries if not (e.lower().startswith('dm_') or e.lower().startswith('dm-')) or username.lower() in e.lower()]
-
-            if show_all:
-                entries = ['.', '..'] + entries
-            entries.sort()
-
-            if is_long:
-                lines = []
-                for entry in entries:
-                    entry_path = os.path.join(target_dir, entry)
-                    try:
-                        st = os.stat(entry_path)
-                        is_dir = os.path.isdir(entry_path)
-                        is_dm_or_priv = 'dm_' in entry.lower() or 'dm-' in entry.lower() or entry.lower() == username.lower()
-                        perm = ('d' if is_dir else '-') + ('rwx------' if is_dm_or_priv else 'rwxr-xr-x')
-                        size = str(st.st_size).rjust(8)
-                        dt = datetime.datetime.fromtimestamp(st.st_mtime).strftime('%b %d %H:%M')
-                        display_name = f"{entry}/" if is_dir else entry
-                        lines.append(f"{perm}  1 {username.ljust(8)} theysynced {size} {dt} {display_name}")
-                    except Exception:
-                        lines.append(f"-rw-r--r--  1 {username} theysynced      1024 Oct 18 12:00 {entry}")
-                return {"output": "\\n".join(lines), "error": "", "new_cwd": cwd}
-            else:
-                formatted = []
-                for entry in entries:
-                    if os.path.isdir(os.path.join(target_dir, entry)):
-                        formatted.append(f"{entry}/")
-                    else:
-                        formatted.append(entry)
-                return {"output": "   ".join(formatted), "error": "", "new_cwd": cwd}
-        except Exception as e:
-            return {"output": "", "error": f"ls: cannot access '{target_dir}': No such file or directory", "new_cwd": cwd}
-
-    # 4. CAT
-    if cmd == 'cat':
-        if not args and stdin_data:
-            return {"output": stdin_data, "error": "", "new_cwd": cwd}
-        if not args:
-            return {"output": "", "error": "cat: missing file operand", "new_cwd": cwd}
-        output_chunks = []
-        for file_path in args:
-            allowed, p_err = check_permission(file_path, username, is_admin)
-            if not allowed:
-                return {"output": "", "error": p_err, "new_cwd": cwd}
-            try:
-                with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-                    output_chunks.append(f.read())
-            except Exception as e:
-                return {"output": "", "error": f"cat: {file_path}: No such file or directory", "new_cwd": cwd}
-        return {"output": "\\n".join(output_chunks), "error": "", "new_cwd": cwd}
-
-    # 5. HEAD & TAIL
-    if cmd in ['head', 'tail']:
-        count = 10
-        file_arg = None
-        i = 0
-        while i < len(args):
-            if args[i] == '-n' and i + 1 < len(args):
-                count = int(args[i+1])
-                i += 2
-            elif not args[i].startswith('-'):
-                file_arg = args[i]
-                i += 1
-            else:
-                i += 1
-
-        source_lines = []
-        if file_arg:
-            try:
-                with open(file_arg, 'r', encoding='utf-8', errors='replace') as f:
-                    source_lines = f.readlines()
-            except Exception:
-                return {"output": "", "error": f"{cmd}: {file_arg}: No such file or directory", "new_cwd": cwd}
-        elif stdin_data:
-            source_lines = [l + '\\n' for l in stdin_data.split('\\n')]
-        else:
-            return {"output": "", "error": f"{cmd}: missing file operand", "new_cwd": cwd}
-
-        sliced = source_lines[:count] if cmd == 'head' else source_lines[-count:]
-        return {"output": "".join(sliced).rstrip('\\n'), "error": "", "new_cwd": cwd}
-
-    # 6. GREP
-    if cmd == 'grep':
-        ignore_case = '-i' in args
-        invert = '-v' in args
-        clean_args = [a for a in args if not a.startswith('-')]
-        if not clean_args:
-            return {"output": "", "error": "grep: missing pattern", "new_cwd": cwd}
-        pattern = clean_args[0]
-        files = clean_args[1:]
-
-        flags = re.IGNORECASE if ignore_case else 0
-        try:
-            regex = re.compile(pattern, flags)
-        except Exception as e:
-            return {"output": "", "error": f"grep: invalid regex '{pattern}': {e}", "new_cwd": cwd}
-
-        matched_lines = []
-        if files:
-            for fn in files:
-                for file_path in glob.glob(fn) or [fn]:
-                    try:
-                        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-                            for idx, line in enumerate(f):
-                                line_clean = line.rstrip('\\n')
-                                matches = bool(regex.search(line_clean))
-                                if matches != invert:
-                                    prefix = f"{file_path}:" if len(files) > 1 or '*' in fn else ""
-                                    matched_lines.append(f"{prefix}{line_clean}")
-                    except Exception:
-                        pass
-        elif stdin_data:
-            for line in stdin_data.split('\\n'):
-                matches = bool(regex.search(line))
-                if matches != invert:
-                    matched_lines.append(line)
-
-        return {"output": "\\n".join(matched_lines) if matched_lines else "(no match found)", "error": "", "new_cwd": cwd}
-
-    # 7. FIND
-    if cmd == 'find':
-        start_dir = args[0] if args and not args[0].startswith('-') else '.'
-        pattern = '*'
-        if '-name' in args:
-            idx = args.index('-name')
-            if idx + 1 < len(args):
-                pattern = args[idx + 1]
-
-        found = []
-        for root, dirs, files in os.walk(start_dir):
-            for name in dirs + files:
-                if fnmatch.fnmatch(name, pattern):
-                    found.append(os.path.join(root, name))
-        return {"output": "\\n".join(found), "error": "", "new_cwd": cwd}
-
-    # 8. MKDIR
-    if cmd == 'mkdir':
-        targets = [a for a in args if not a.startswith('-')]
-        if not targets:
-            return {"output": "", "error": "mkdir: missing operand", "new_cwd": cwd}
-        for t in targets:
-            os.makedirs(t, exist_ok=True)
-        return {"output": f"Created directory {', '.join(targets)}", "error": "", "new_cwd": cwd}
-
-    # 9. TOUCH
-    if cmd == 'touch':
-        if not args:
-            return {"output": "", "error": "touch: missing file operand", "new_cwd": cwd}
-        for fn in args:
-            with open(fn, 'a'):
-                os.utime(fn, None)
-        return {"output": f"Created/Updated {', '.join(args)}", "error": "", "new_cwd": cwd}
-
-    # 10. RM
-    if cmd == 'rm':
-        targets = [a for a in args if not a.startswith('-')]
-        if not targets:
-            return {"output": "", "error": "rm: missing operand", "new_cwd": cwd}
-        for t in targets:
-            if os.path.isdir(t):
-                shutil.rmtree(t, ignore_errors=True)
-            elif os.path.exists(t):
-                os.remove(t)
-        return {"output": f"Removed {', '.join(targets)}", "error": "", "new_cwd": cwd}
-
-    # 11. CP & MV
-    if cmd in ['cp', 'mv']:
-        clean_args = [a for a in args if not a.startswith('-')]
-        if len(clean_args) < 2:
-            return {"output": "", "error": f"{cmd}: missing destination file operand", "new_cwd": cwd}
-        src, dest = clean_args[0], clean_args[1]
-        try:
-            if cmd == 'cp':
-                if os.path.isdir(src):
-                    shutil.copytree(src, dest, dirs_exist_ok=True)
-                else:
-                    shutil.copy2(src, dest)
-                return {"output": f"Copied '{src}' -> '{dest}'", "error": "", "new_cwd": cwd}
-            else:
-                shutil.move(src, dest)
-                return {"output": f"Moved '{src}' -> '{dest}'", "error": "", "new_cwd": cwd}
-        except Exception as e:
-            return {"output": "", "error": f"{cmd}: {e}", "new_cwd": cwd}
-
-    # 12. ECHO
-    if cmd == 'echo':
-        text = " ".join(args).strip('"').strip("'")
-        return {"output": text, "error": "", "new_cwd": cwd}
-
-    # 13. WC
-    if cmd == 'wc':
-        files = [a for a in args if not a.startswith('-')]
-        if files:
-            res_lines = []
-            for fn in files:
-                try:
-                    with open(fn, 'r', encoding='utf-8', errors='replace') as f:
-                        content = f.read()
-                        l = len(content.split('\\n'))
-                        w = len(content.split())
-                        c = len(content)
-                        res_lines.append(f"  {l}  {w}  {c} {fn}")
-                except Exception:
-                    pass
-            return {"output": "\\n".join(res_lines), "error": "", "new_cwd": cwd}
-        elif stdin_data:
-            l = len(stdin_data.split('\\n'))
-            w = len(stdin_data.split())
-            c = len(stdin_data)
-            return {"output": f"  {l}  {w}  {c}", "error": "", "new_cwd": cwd}
-        return {"output": "0 0 0", "error": "", "new_cwd": cwd}
-
-    # 14. TREE
-    if cmd == 'tree':
-        start_dir = args[0] if args else '.'
-        lines = [f"{start_dir}"]
-        for root, dirs, files in os.walk(start_dir):
-            level = root.replace(start_dir, '').count(os.sep)
-            indent = ' ' * 4 * level
-            lines.append(f"{indent}├── {os.path.basename(root)}/")
-            subindent = ' ' * 4 * (level + 1)
-            for f in files:
-                lines.append(f"{subindent}├── {f}")
-        return {"output": "\\n".join(lines[:60]), "error": "", "new_cwd": cwd}
-
-    # 15. TAR & ZIP (Full Organization Archive & Compression)
-    if cmd == 'tar':
-        # tar -czvf archive.tar.gz target
-        is_create = '-c' in "".join(args)
-        is_extract = '-x' in "".join(args)
-        clean = [a for a in args if not a.startswith('-')]
-        if not clean:
-            return {"output": "", "error": "tar: missing archive file operand", "new_cwd": cwd}
-        archive_name = clean[0]
-        sources = clean[1:] if len(clean) > 1 else ['/workspace']
-
-        try:
-            if is_create or archive_name.endswith('.tar.gz') or archive_name.endswith('.tar'):
-                mode = 'w:gz' if archive_name.endswith('.gz') or 'z' in "".join(args) else 'w'
-                with tarfile.open(archive_name, mode) as tar:
-                    for src in sources:
-                        tar.add(src, arcname=os.path.basename(src))
-                sz = os.path.getsize(archive_name)
-                return {"output": f"Successfully created archive '{archive_name}' ({sz} bytes). Ready in /workspace/export.", "error": "", "new_cwd": cwd}
-            elif is_extract:
-                with tarfile.open(archive_name, 'r:*') as tar:
-                    tar.extractall(path='.')
-                return {"output": f"Extracted '{archive_name}' into current directory.", "error": "", "new_cwd": cwd}
-        except Exception as e:
-            return {"output": "", "error": f"tar error: {e}", "new_cwd": cwd}
-
-    if cmd == 'zip':
-        if len(args) < 2:
-            return {"output": "", "error": "Usage: zip archive.zip file1 file2 ...", "new_cwd": cwd}
-        archive_name = args[0]
-        sources = args[1:]
-        try:
-            with zipfile.ZipFile(archive_name, 'w', zipfile.ZIP_DEFLATED) as zf:
-                for src in sources:
-                    if os.path.isdir(src):
-                        for root, _, files in os.walk(src):
-                            for file in files:
-                                p = os.path.join(root, file)
-                                zf.write(p, os.path.relpath(p, os.path.join(src, '..')))
-                    else:
-                        zf.write(src, os.path.basename(src))
-            sz = os.path.getsize(archive_name)
-            return {"output": f"Successfully created zip archive '{archive_name}' ({sz} bytes).", "error": "", "new_cwd": cwd}
-        except Exception as e:
-            return {"output": "", "error": f"zip error: {e}", "new_cwd": cwd}
-
-    # 16. EXPORT-ORG (Full Organization Backup Script)
-    if cmd in ['export-org', 'backup-org', 'theysynced-export']:
-        os.makedirs('/workspace/export', exist_ok=True)
-        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-        tar_path = f"/workspace/export/{hostname}_backup_{timestamp}.tar.gz"
-        zip_path = f"/workspace/export/{hostname}_backup_{timestamp}.zip"
-
-        with tarfile.open(tar_path, 'w:gz') as tar:
-            tar.add('/workspace/chats', arcname='chats')
-            tar.add('/workspace/spreadsheets', arcname='spreadsheets')
-            tar.add('/workspace/drawings', arcname='drawings')
-            tar.add('/workspace/docs', arcname='docs')
-            tar.add('/workspace/files', arcname='files')
-            tar.add('/workspace/tasks', arcname='tasks')
-            tar.add('/etc/theysynced', arcname='system_config')
-
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for root_folder in ['/workspace/chats', '/workspace/spreadsheets', '/workspace/drawings', '/workspace/docs', '/workspace/files', '/workspace/tasks', '/etc/theysynced']:
-                for r, _, fls in os.walk(root_folder):
-                    for f in fls:
-                        full_p = os.path.join(r, f)
-                        zf.write(full_p, os.path.relpath(full_p, '/workspace'))
-
-        tar_sz = os.path.getsize(tar_path)
-        zip_sz = os.path.getsize(zip_path)
-        summary = f"""===================================================================
-✅ THEY-SYNCED FULL ORGANIZATION BACKUP COMPLETED
-===================================================================
-Target Organization: {hostname}
-Timestamp:           {datetime.datetime.now().isoformat()}
-Tarball Archive:     {tar_path} ({tar_sz} bytes)
-Zip Archive:         {zip_path} ({zip_sz} bytes)
-Included Workspaces:
-  📁 /workspace/chats/        (All channel and DM conversation logs)
-  📁 /workspace/spreadsheets/ (Enterprise financial sheets & CSVs)
-  📁 /workspace/drawings/     (Excalidraw system architecture diagrams)
-  📁 /workspace/docs/         (Knowledgebase documents & markdown)
-  📁 /workspace/files/        (Storage assets & media)
-  📁 /workspace/tasks/        (Jira tasks, backlog, and Kanban board)
-  📁 /etc/theysynced/         (Roster, permissions, & encryption keys)
-
-Files are saved into /workspace/export/ and ready for immediate download.
-==================================================================="""
-        return {"output": summary, "error": "", "new_cwd": cwd}
-
-    # 17. OPEN / XDG-OPEN (Visualizer Interoperability)
-    if cmd in ['open', 'xdg-open', 'view']:
-        if not args:
-            return {"output": "Opening GUI File Manager...", "error": "", "new_cwd": cwd, "open_tab": "assets", "open_id": cwd}
-        target_file = args[0]
-
-        # Web URL check
-        if target_file.startswith('http://') or target_file.startswith('https://') or target_file.startswith('localhost'):
-            return {"output": f"Opening '{target_file}' in Web Browser tab...", "error": "", "new_cwd": cwd, "open_tab": "browser", "open_id": target_file}
-
-        # Resolve target
-        clean_target = os.path.abspath(target_file) if not target_file.startswith('/') else target_file
-        basename = os.path.basename(clean_target)
-
-        if 'sheet' in basename or basename.endswith('.csv'):
-            return {"output": f"Opening '{basename}' in Spreadsheets Tab...", "error": "", "new_cwd": cwd, "open_tab": "spreadsheet", "open_id": basename}
-        elif 'excalidraw' in basename:
-            return {"output": f"Opening '{basename}' in Excalidraw Canvas...", "error": "", "new_cwd": cwd, "open_tab": "whiteboard", "open_id": basename}
-        elif 'doc' in basename or basename.endswith('.md'):
-            return {"output": f"Opening '{basename}' in Docs Tab...", "error": "", "new_cwd": cwd, "open_tab": "docs", "open_id": basename}
-        elif 'task' in basename or 'kanban' in basename.lower() or clean_target.startswith('/workspace/tasks'):
-            return {"output": f"Opening Jira Tasks Board in Kanban View...", "error": "", "new_cwd": cwd, "open_tab": "tasks", "open_id": basename}
-        elif 'chat' in basename or clean_target.startswith('/workspace/chats'):
-            return {"output": f"Opening '{basename}' in Teams & Chat Tab...", "error": "", "new_cwd": cwd, "open_tab": "teams", "open_id": basename}
-        elif os.path.isdir(clean_target):
-            return {"output": f"Opening GUI File Manager at '{clean_target}'...", "error": "", "new_cwd": clean_target, "open_tab": "assets", "open_id": clean_target}
-        else:
-            return {"output": f"Opening '{basename}' in GUI File Manager...", "error": "", "new_cwd": cwd, "open_tab": "assets", "open_id": basename}
-
-    # 17.5 TASK / JIRA CLI
-    if cmd in ['task', 'tasks', 'jira']:
-        subcmd = args[0].lower() if args else 'list'
-        tasks_file = '/workspace/tasks/tasks.json'
-        tasks_data = []
-        if os.path.exists(tasks_file):
-            try:
-                with open(tasks_file, 'r') as f:
-                    tasks_data = json.load(f)
-            except Exception:
-                tasks_data = []
-
-        if subcmd in ['list', 'ls']:
-            if not tasks_data:
-                return {"output": "No tasks found. Create one with: task add \"Task title\"", "error": "", "new_cwd": cwd}
-            out_lines = [f"{'ID':<8} {'STATUS':<14} {'PRIORITY':<10} {'ASSIGNEE':<16} {'TITLE'}"]
-            out_lines.append("-" * 75)
-            for t in tasks_data:
-                tid = t.get('id', 'TS-?')
-                st = t.get('status', 'todo').upper()
-                pri = t.get('priority', 'medium').upper()
-                assignee = f"@{t.get('assignee', 'unassigned')}"
-                title = t.get('title', '')
-                out_lines.append(f"{tid:<8} {st:<14} {pri:<10} {assignee:<16} {title}")
-            return {"output": "\\n".join(out_lines), "error": "", "new_cwd": cwd}
-
-        elif subcmd in ['add', 'create', 'new']:
-            task_title = " ".join(args[1:]) if len(args) > 1 else ""
-            if not task_title:
-                return {"output": "", "error": "Usage: task add <title>", "new_cwd": cwd}
-            new_id = f"TS-{len(tasks_data) + 101}"
-            now_iso = datetime.datetime.now().isoformat()
-            new_task = {
-                "id": new_id,
-                "title": task_title,
-                "description": "",
-                "status": "todo",
-                "priority": "medium",
-                "assignee": username,
-                "creator": username,
-                "created_at": now_iso,
-                "updated_at": now_iso,
-                "tags": ["CLI", "Linux"]
-            }
-            tasks_data.append(new_task)
-            os.makedirs('/workspace/tasks', exist_ok=True)
-            with open(tasks_file, 'w') as f:
-                json.dump(tasks_data, f, indent=2)
-            return {"output": f"✅ Created Task [{new_id}]: {task_title}", "error": "", "new_cwd": cwd}
-
-        elif subcmd in ['done', 'complete', 'finish']:
-            if len(args) < 2:
-                return {"output": "", "error": "Usage: task done <ID>", "new_cwd": cwd}
-            target_id = args[1].upper()
-            found = False
-            for t in tasks_data:
-                if t.get('id', '').upper() == target_id:
-                    t['status'] = 'done'
-                    t['updated_at'] = datetime.datetime.now().isoformat()
-                    found = True
-                    break
-            if not found:
-                return {"output": "", "error": f"Task '{target_id}' not found.", "new_cwd": cwd}
-            with open(tasks_file, 'w') as f:
-                json.dump(tasks_data, f, indent=2)
-            return {"output": f"✅ Marked Task [{target_id}] as DONE.", "error": "", "new_cwd": cwd}
-
-        elif subcmd in ['open', 'gui', 'board']:
-            return {"output": "Opening Jira Tasks Kanban Board...", "error": "", "new_cwd": cwd, "open_tab": "tasks", "open_id": "board"}
-        else:
-            return {"output": "Usage: task [list|add \"<title>\"|done <id>|open]", "error": "", "new_cwd": cwd}
-
-    # 17.6 BROWSER / CURL-WEB CLI
-    if cmd in ['browser', 'browse', 'curl-web', 'surf']:
-        target_url = args[0] if args else 'http://localhost:3000'
-        return {"output": f"Opening '{target_url}' in Web Browser tab...", "error": "", "new_cwd": cwd, "open_tab": "browser", "open_id": target_url}
-
-    # 18. SYSTEM METRICS: uname, hostname, date, uptime, df, free, whoami, who, id
-    if cmd == 'uname':
-        return {"output": f"Linux {hostname} 6.8.0-enterprise-wasm #1 SMP PREEMPT_DYNAMIC CloudflareEdge x86_64 GNU/Linux", "error": "", "new_cwd": cwd}
-
-    if cmd == 'hostname':
-        return {"output": hostname, "error": "", "new_cwd": cwd}
-
-    if cmd == 'date':
-        return {"output": datetime.datetime.now(datetime.timezone.utc).strftime('%a %b %d %H:%M:%S UTC %Y'), "error": "", "new_cwd": cwd}
-
-    if cmd == 'uptime':
-        return {"output": f" {datetime.datetime.now().strftime('%H:%M:%S')} up 90 days, 1 user, load average: 0.04, 0.02, 0.00", "error": "", "new_cwd": cwd}
-
-    if cmd == 'df':
-        return {"output": """Filesystem      Size  Used Avail Use% Mounted on
-overlay          10G  140M  9.8G   2% /
-tmpfs           1.0G     0  1.0G   0% /dev
-theysynced-d1   5.0G   52M  4.9G   2% /workspace
-theysynced-kv    10G  240M  9.7G   3% /workspace/files""", "error": "", "new_cwd": cwd}
-
-    if cmd == 'free':
-        return {"output": """               total        used        free      shared  buff/cache   available
-Mem:            2048         210        1710           4         128        1838
-Swap:              0           0           0""", "error": "", "new_cwd": cwd}
-
-    if cmd == 'whoami':
-        return {"output": username, "error": "", "new_cwd": cwd}
-
-    if cmd in ['who', 'users']:
-        return {"output": f"{username.ljust(16)} pts/0    {datetime.datetime.now().strftime('%Y-%m-%d')} (Active Session)", "error": "", "new_cwd": cwd}
-
-    if cmd == 'id':
-        return {"output": f"uid=1000({username}) gid=1000(theysynced) groups=1000(theysynced),27(sudo),100(users)", "error": "", "new_cwd": cwd}
-
-    if cmd == 'env':
-        return {"output": "\\n".join(f"{k}={v}" for k, v in os.environ.items()), "error": "", "new_cwd": cwd}
-
-    # 19. PYTHON EXECUTION: python script.py or python -c "..."
-    if cmd in ['python', 'python3']:
-        if '-c' in args:
-            code_idx = args.index('-c') + 1
-            code = " ".join(args[code_idx:]).strip('"').strip("'")
-            try:
-                import io, sys
-                old_stdout = sys.stdout
-                sys.stdout = buffer = io.StringIO()
-                exec(code, globals())
-                sys.stdout = old_stdout
-                return {"output": buffer.getvalue(), "error": "", "new_cwd": os.getcwd()}
-            except Exception as e:
-                sys.stdout = old_stdout
-                return {"output": "", "error": f"Python error: {e}", "new_cwd": cwd}
-        elif args:
-            script_path = args[0]
-            try:
-                with open(script_path, 'r', encoding='utf-8') as f:
-                    code = f.read()
-                import io, sys
-                old_stdout = sys.stdout
-                sys.stdout = buffer = io.StringIO()
-                exec(code, globals())
-                sys.stdout = old_stdout
-                return {"output": buffer.getvalue(), "error": "", "new_cwd": os.getcwd()}
-            except Exception as e:
-                sys.stdout = old_stdout
-                return {"output": "", "error": f"Python error in '{script_path}': {e}", "new_cwd": cwd}
-        else:
-            return {"output": "__ENTER_PYTHON_REPL__", "error": "", "new_cwd": cwd}
-
-    # Command Not Found
-    return {"output": "", "error": f"bash: {cmd}: command not found. Type 'help' for built-in Linux commands.", "new_cwd": cwd}
-      `);
+      try {
+        await pyodide.loadPackage('micropip');
+      } catch (_) {}
 
       pyodideRef.current = pyodide;
-      setIsPyodideReady(true);
       setIsPyodideLoading(false);
 
       appendLog({
         id: `sys_ready_${Date.now()}`,
         user: 'system',
         type: 'system',
-        text: '🐍 Linux Subsystem & Python 3.12 WebAssembly Engine mounted and ready!',
+        text: 'Python 3.12 WebAssembly runtime initialized.',
         timestamp: new Date().toISOString(),
       });
 
@@ -990,23 +305,23 @@ Swap:              0           0           0""", "error": "", "new_cwd": cwd}
         id: `err_py_${Date.now()}`,
         user: 'system',
         type: 'error',
-        text: `Failed to initialize Linux engine: ${err.message}`,
+        text: `Failed to initialize Python runtime: ${err.message}`,
         timestamp: new Date().toISOString(),
       });
       return null;
     }
   };
 
-  // Execute Command via Real POSIX Engine
+  // Execute Command via Virtual POSIX Linux Kernel
   const executeCommand = async (rawCmd: string) => {
     const trimmed = rawCmd.trim();
     if (!trimmed) return;
 
-    // Handle Python REPL
+    // 1. Handle Python REPL
     if (isPythonRepl) {
       appendLog({
         id: `repl_${Date.now()}`,
-        user: user.username,
+        user: isRoot ? 'root' : user.username,
         type: 'command',
         text: `>>> ${trimmed}`,
         timestamp: new Date().toISOString(),
@@ -1032,17 +347,16 @@ Swap:              0           0           0""", "error": "", "new_cwd": cwd}
           if (res !== undefined) {
             appendLog({
               id: `out_py_${Date.now()}`,
-              user: user.username,
+              user: isRoot ? 'root' : user.username,
               type: 'output',
               text: String(res),
               timestamp: new Date().toISOString(),
             });
           }
-          await syncPyodideChangesBackToAssets(pyodide);
         } catch (err: any) {
           appendLog({
             id: `err_py_${Date.now()}`,
-            user: user.username,
+            user: isRoot ? 'root' : user.username,
             type: 'error',
             text: `Traceback (most recent call last):\n${err.message}`,
             timestamp: new Date().toISOString(),
@@ -1052,12 +366,61 @@ Swap:              0           0           0""", "error": "", "new_cwd": cwd}
       return;
     }
 
-    // Normal POSIX Command
+    // 2. Handle Node.js REPL
+    if (isNodeRepl) {
+      appendLog({
+        id: `repl_node_${Date.now()}`,
+        user: isRoot ? 'root' : user.username,
+        type: 'command',
+        text: `> ${trimmed}`,
+        timestamp: new Date().toISOString(),
+      });
+      setInputVal('');
+
+      if (['.exit', 'exit', 'quit', 'exit()'].includes(trimmed)) {
+        setIsNodeRepl(false);
+        appendLog({
+          id: `out_${Date.now()}`,
+          user: 'system',
+          type: 'system',
+          text: 'Exited Node.js v20.11.0 REPL. Back in bash.',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      try {
+        const res = new Function(`return (${trimmed});`)();
+        if (res !== undefined) {
+          appendLog({
+            id: `out_node_${Date.now()}`,
+            user: isRoot ? 'root' : user.username,
+            type: 'output',
+            text: typeof res === 'object' ? JSON.stringify(res, null, 2) : String(res),
+            timestamp: new Date().toISOString(),
+          });
+        }
+      } catch (err: any) {
+        appendLog({
+          id: `err_node_${Date.now()}`,
+          user: isRoot ? 'root' : user.username,
+          type: 'error',
+          text: `Uncaught ${err.message}`,
+          timestamp: new Date().toISOString(),
+        });
+      }
+      return;
+    }
+
+    // Normal Prompt Log
+    const currentPromptUser = isRoot ? 'root' : user.username;
+    const currentPromptSymbol = isRoot ? '#' : '$';
+
     appendLog({
       id: `cmd_${Date.now()}`,
-      user: user.username,
+      user: currentPromptUser,
       type: 'command',
-      text: `${user.username}@${hostname}:${cwd}$ ${trimmed}`,
+      text: `${currentPromptUser}@${hostname}:${cwd}${currentPromptSymbol} ${trimmed}`,
       timestamp: new Date().toISOString(),
     });
 
@@ -1065,10 +428,24 @@ Swap:              0           0           0""", "error": "", "new_cwd": cwd}
     setHistoryIndex(-1);
     setInputVal('');
 
-    // Fast-path client UI commands: clear, nano, help, gui
+    // Fast-path client UI commands: clear, help, gui, nano, exit
     if (trimmed === 'clear') {
       setLogs([]);
       return;
+    }
+
+    if (trimmed === 'exit' || trimmed === 'logout') {
+      if (isRoot) {
+        setIsRoot(false);
+        appendLog({
+          id: `out_${Date.now()}`,
+          user: 'system',
+          type: 'system',
+          text: `logout\nSwitched back to user session: ${user.username}`,
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
     }
 
     if (trimmed === 'gui' || trimmed === 'nautilus' || trimmed === 'explorer') {
@@ -1090,27 +467,15 @@ Swap:              0           0           0""", "error": "", "new_cwd": cwd}
         return;
       }
 
-      // Permission check for DM chats or restricted files
-      const lowerFile = fileName.toLowerCase();
-      if ((lowerFile.startsWith('dm_') || lowerFile.startsWith('dm-')) && !isAdmin) {
-        if (!lowerFile.includes(user.username.toLowerCase())) {
-          appendLog({ id: `err_${Date.now()}`, user: 'system', type: 'error', text: `nano: ${fileName}: Permission denied (Private direct message conversation)`, timestamp: new Date().toISOString() });
-          return;
-        }
+      const kernel = kernelRef.current || new LinuxVirtualKernel(company.name, company.id, hostname, installedPackages);
+      const filePath = kernel.normalizePath(fileName, cwd, currentPromptUser);
+      const [allowed, pErr] = kernel.checkPermission(filePath, currentPromptUser, isRoot, isAdmin);
+      if (!allowed) {
+        appendLog({ id: `err_${Date.now()}`, user: 'system', type: 'error', text: `nano: ${fileName}: ${pErr}`, timestamp: new Date().toISOString() });
+        return;
       }
 
-      // Read file if exists
-      let existingContent = '';
-      if (pyodideRef.current && pyodideRef.current.FS) {
-        try {
-          existingContent = pyodideRef.current.FS.readFile(`${cwd}/${fileName}`.replace(/\/+/g, '/'), { encoding: 'utf8' });
-        } catch (_) {}
-      }
-      if (!existingContent) {
-        const found = assets.find((a) => a.name.toLowerCase() === fileName.toLowerCase());
-        existingContent = found?.content || '';
-      }
-
+      const existingContent = kernel.readFile(filePath) || '';
       setNanoFileName(fileName);
       setNanoContent(existingContent);
       setNanoModified(false);
@@ -1125,76 +490,94 @@ Swap:              0           0           0""", "error": "", "new_cwd": cwd}
         type: 'output',
         text: `TheySynced Enterprise Linux Subsystem v6.8.0-wasm [Org: ${company.name}]
 Unified Operating System Commands:
-  Visualizer Interoperability:
-    open <file>        Open file in its specialized visualizer tab:
-                       - .sheet.json / .csv  -> Spreadsheets Tab
-                       - .excalidraw.json    -> Excalidraw Canvas Tab
-                       - .doc.json / .md     -> Docs Tab
-                       - .chat.json / .log   -> Teams & Chat Tab
-                       - tasks.json / KANBAN -> Jira Tasks Kanban Tab
-                       - URLs (http/https)   -> Web Browser Tab
-                       - directories         -> Nautilus File System GUI
-    task [ls|add|done] Manage Jira tasks directly from shell
-    browser <url>      Open in-system Web Browser (preview & localhost dev inspector)
-    gui                Switch directly to the graphical File Manager at current path
+  Privileges & Superuser:
+    sudo <cmd>                   Execute command as superuser (root)
+    sudo su / su                 Switch shell session to root user
+    whoami / id                  Show current identity and POSIX UID/GID
 
-  Organization Data & Exports:
-    export-org         Generate complete encrypted archive (.tar.gz and .zip) of:
-                       /workspace/chats, /workspace/spreadsheets, /workspace/drawings,
-                       /workspace/docs, /workspace/files, and /etc/theysynced configuration
-    tar -czvf <f> <d>  Create GNU compressed tarball archive
-    zip <f.zip> <src>  Create standard zip archive
+  Package Management:
+    sudo apt update              Refresh Debian package repository indexes
+    sudo apt install <pkg...>    Install packages (e.g. python3, node, git, neofetch, htop, curl, cowsay)
+    sudo apt remove <pkg...>     Remove installed package
+    apt list [--installed]       List available or installed packages
+    brew install <pkg...>        Install formula via Homebrew (e.g. brew install python)
+    brew list / brew doctor      List formulae or check Homebrew health
 
-  POSIX Core Utilities (Real WebAssembly Linux Kernel):
-    ls [-l|-a|-h]      List directory contents with octal permissions & metadata
-    cd <path>          Change working directory (e.g. cd /workspace/chats, cd ..)
-    pwd                Print working directory
-    cat <files...>     Read & display files (supports pipes | and redirects >)
-    head / tail [-n N] Display first or last N lines of files or pipeline
-    grep [-i|-v] <pat> Search files or stdin stream using regular expressions
-    find <dir> -name   Search directory tree recursively
-    touch <file>       Create file or update timestamps
-    mkdir [-p] <dir>   Create directories
-    rm [-rf] <target>  Remove files or folders
-    cp [-r] / mv       Copy or move files and directory trees
-    echo <txt> [>|>>]  Print or redirect text to file
-    wc [-l|-w|-c]      Count lines, words, and characters
-    tree               Display recursive directory tree structure
+  Runtimes & Compilers (Install via apt or brew first!):
+    python3 <file.py>            Run Python script (requires: sudo apt install python3)
+    python3                      Enter interactive Python 3.12 REPL
+    pip install <pkg>            Install Python packages via micropip
+    node <file.js>               Run JavaScript code (requires: sudo apt install node)
+    node                         Enter interactive Node.js REPL
+    npm install / npm init       Node package manager
+    gcc <file.c> -o <binary>     Compile C code (requires: sudo apt install gcc)
+    git <cmd>                    Git version control (requires: sudo apt install git)
 
-  Runtimes & Scripts:
-    python <file.py>   Execute Python script with full standard library
-    python -c "<code>" Run inline Python expression
-    python             Enter interactive Python 3.12 REPL mode
-    pip install <pkg>  Install Python packages via WebAssembly (e.g. pip install sympy)
+  Diagnostics & Tools:
+    neofetch / fastfetch         Display system hardware and Linux distro ASCII art
+    htop / top                   Interactive system process monitor
+    curl <url>                   Transfer data over HTTP
+    wget <url>                   Download file to current folder
+    cowsay <text>                ASCII cow text banner
+    figlet <text>                ASCII large letter banner
+    task [ls|add|open]           Manage Jira Kanban tasks
+    browser <url>                In-system browser & localhost dev inspector
 
-  Diagnostics:
-    uname -a / hostname / whoami / who / id / date / uptime / df / free / env`,
+  POSIX Core Utilities:
+    ls [-l|-a|-h]                List directory contents with octal permissions
+    cd <path>                    Change directory (e.g. cd /workspace/chats)
+    pwd                          Print working directory
+    cat <files...>               Read files (supports pipes | and redirects >)
+    head / tail [-n N]           Display first or last lines
+    grep [-i|-v] <pat>           Search files or streams using regex
+    mkdir [-p] / touch           Create directories and files
+    rm [-r] / cp / mv            Remove, copy, or move files
+    echo <text> [>|>>]           Print or redirect text to file
+    wc [-l|-w|-c]                Count lines, words, bytes
+    tree                         Display recursive directory tree
+    export-org                   Create encrypted tarball and zip of entire organization
+    open <file>                  Open file in visualizer tab (spreadsheet, drawing, doc, etc.)
+    gui                          Switch directly to Nautilus graphical file manager`,
         timestamp: new Date().toISOString(),
       });
       return;
     }
 
-    // Run command inside Pyodide POSIX engine
-    const pyodide = await initPyodide();
-    if (!pyodide) return;
+    // Execute through LinuxVirtualKernel
+    const kernel = kernelRef.current || new LinuxVirtualKernel(company.name, company.id, hostname, installedPackages);
+    const result: ShellExecResult = await kernel.executeCommandLine(
+      trimmed,
+      cwd,
+      currentPromptUser,
+      isRoot,
+      isAdmin
+    );
 
-    try {
-      // Execute command in Python POSIX shell engine
-      const safeCmd = JSON.stringify(trimmed);
-      const safeCwd = JSON.stringify(cwd);
-      const safeUser = JSON.stringify(user.username);
-      const safeHost = JSON.stringify(hostname);
-      const safeIsAdmin = isAdmin ? 'True' : 'False';
+    // Handle user switch (e.g. sudo su)
+    if (result.switchUser) {
+      if (result.switchUser === 'root') {
+        setIsRoot(true);
+      } else {
+        setIsRoot(false);
+      }
+    }
 
-      const execCode = `
-import json
-res = posix_shell_execute(${safeCmd}, ${safeCwd}, ${safeUser}, ${safeHost}, ${safeIsAdmin})
-json.dumps(res)
-`;
-      const resultJsonStr = await pyodide.runPythonAsync(execCode);
-      const result = JSON.parse(resultJsonStr);
+    // Handle package changes
+    if (result.installedPackagesChanged) {
+      await saveInstalledPackages(result.installedPackagesChanged);
+    }
 
-      if (result.output === '__ENTER_PYTHON_REPL__') {
+    // Handle CWD changes
+    if (result.newCwd && result.newCwd !== cwd) {
+      setCwd(result.newCwd);
+    }
+
+    // Handle Python execution request
+    if (result.output === '__RUN_PYODIDE_OR_REPL__') {
+      const parts = trimmed.replace(/^sudo\s+/, '').split(/\s+/);
+      const pyArgs = parts.slice(1);
+
+      if (pyArgs.length === 0) {
         setIsPythonRepl(true);
         appendLog({
           id: `out_py_${Date.now()}`,
@@ -1206,49 +589,92 @@ json.dumps(res)
         return;
       }
 
-      if (result.new_cwd && result.new_cwd !== cwd) {
-        setCwd(result.new_cwd);
+      const pyodide = await initPyodide();
+      if (pyodide) {
+        try {
+          if (pyArgs[0] === '-c') {
+            const code = pyArgs.slice(1).join(' ').replace(/^["']|["']$/g, '');
+            const pyRes = await pyodide.runPythonAsync(code);
+            if (pyRes !== undefined) {
+              appendLog({ id: `out_${Date.now()}`, user: currentPromptUser, type: 'output', text: String(pyRes), timestamp: new Date().toISOString() });
+            }
+          } else {
+            const scriptPath = kernel.normalizePath(pyArgs[0], cwd, currentPromptUser);
+            const scriptContent = kernel.readFile(scriptPath);
+            if (scriptContent === null) {
+              appendLog({ id: `err_${Date.now()}`, user: currentPromptUser, type: 'error', text: `python3: can't open file '${pyArgs[0]}': [Errno 2] No such file or directory`, timestamp: new Date().toISOString() });
+            } else {
+              const pyRes = await pyodide.runPythonAsync(scriptContent);
+              if (pyRes !== undefined) {
+                appendLog({ id: `out_${Date.now()}`, user: currentPromptUser, type: 'output', text: String(pyRes), timestamp: new Date().toISOString() });
+              }
+            }
+          }
+        } catch (pyErr: any) {
+          appendLog({ id: `err_${Date.now()}`, user: currentPromptUser, type: 'error', text: `Python error: ${pyErr.message}`, timestamp: new Date().toISOString() });
+        }
       }
+      return;
+    }
 
-      if (result.output) {
-        appendLog({
-          id: `out_${Date.now()}`,
-          user: user.username,
-          type: 'output',
-          text: result.output,
-          timestamp: new Date().toISOString(),
-        });
+    // Handle pip execution request
+    if (result.output === '__RUN_PYODIDE_PIP__') {
+      const parts = trimmed.replace(/^sudo\s+/, '').split(/\s+/);
+      const pyodide = await initPyodide();
+      if (pyodide) {
+        if (parts[1] === 'install' && parts[2]) {
+          appendLog({ id: `out_${Date.now()}`, user: 'system', type: 'system', text: `Collecting ${parts[2]}...\nInstalling collected packages: ${parts[2]} via micropip...`, timestamp: new Date().toISOString() });
+          try {
+            await pyodide.loadPackage(parts[2]);
+            appendLog({ id: `out_${Date.now()}`, user: 'system', type: 'output', text: `Successfully installed ${parts[2]}`, timestamp: new Date().toISOString() });
+          } catch (e: any) {
+            appendLog({ id: `err_${Date.now()}`, user: 'system', type: 'error', text: `pip install error: ${e.message}`, timestamp: new Date().toISOString() });
+          }
+        } else {
+          appendLog({ id: `out_${Date.now()}`, user: 'system', type: 'output', text: 'Usage: pip install <package>', timestamp: new Date().toISOString() });
+        }
       }
+      return;
+    }
 
-      if (result.error) {
-        appendLog({
-          id: `err_${Date.now()}`,
-          user: user.username,
-          type: 'error',
-          text: result.error,
-          timestamp: new Date().toISOString(),
-        });
-      }
-
-      // Check if command triggered visualizer navigation
-      if (result.open_tab && onNavigateTab) {
-        onNavigateTab(result.open_tab as ActiveTab, result.open_id);
-      }
-
-      // Sync any modified or created files back to D1 assets
-      await syncPyodideChangesBackToAssets(pyodide);
-    } catch (err: any) {
+    // Handle Node REPL request
+    if (result.enterNodeRepl) {
+      setIsNodeRepl(true);
       appendLog({
-        id: `err_${Date.now()}`,
+        id: `out_node_${Date.now()}`,
         user: 'system',
-        type: 'error',
-        text: `Execution error: ${err.message}`,
+        type: 'system',
+        text: `Welcome to Node.js v20.11.0.\nType ".exit" to return to bash shell.`,
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (result.output) {
+      appendLog({
+        id: `out_${Date.now()}`,
+        user: currentPromptUser,
+        type: 'output',
+        text: result.output,
         timestamp: new Date().toISOString(),
       });
     }
+
+    if (result.error) {
+      appendLog({
+        id: `err_${Date.now()}`,
+        user: currentPromptUser,
+        type: 'error',
+        text: result.error,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    if (result.openTab && onNavigateTab) {
+      onNavigateTab(result.openTab as ActiveTab, result.openId);
+    }
   };
 
-  // Keyboard navigation & autocomplete
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Enter') {
       executeCommand(inputVal);
@@ -1261,183 +687,129 @@ json.dumps(res)
       }
     } else if (e.key === 'ArrowDown') {
       e.preventDefault();
-      if (historyIndex >= 0) {
+      if (history.length > 0 && historyIndex !== -1) {
         const nextIdx = historyIndex + 1;
-        if (nextIdx < history.length) {
-          setHistoryIndex(nextIdx);
-          setInputVal(history[nextIdx]);
-        } else {
+        if (nextIdx >= history.length) {
           setHistoryIndex(-1);
           setInputVal('');
+        } else {
+          setHistoryIndex(nextIdx);
+          setInputVal(history[nextIdx] || '');
         }
-      }
-    } else if (e.key === 'Tab') {
-      e.preventDefault();
-      // Tab autocomplete from current directory
-      if (pyodideRef.current && pyodideRef.current.FS) {
-        try {
-          const files: string[] = pyodideRef.current.FS.readdir(cwd);
-          const tokens = inputVal.split(' ');
-          const last = tokens[tokens.length - 1].toLowerCase();
-          if (last) {
-            const match = files.find((f) => f.toLowerCase().startsWith(last) && f !== '.' && f !== '..');
-            if (match) {
-              tokens[tokens.length - 1] = match;
-              setInputVal(tokens.join(' '));
-            }
-          }
-        } catch (_) {}
       }
     }
   };
 
-  // Nano Save Handler
+  // Nano text editor handlers
   const handleNanoSave = async () => {
-    if (!nanoFileName) return;
-    const fullPath = `${cwd}/${nanoFileName}`.replace(/\/+/g, '/');
-
-    if (pyodideRef.current && pyodideRef.current.FS) {
-      try {
-        pyodideRef.current.FS.writeFile(fullPath, nanoContent);
-      } catch (_) {}
+    const kernel = kernelRef.current;
+    if (kernel) {
+      const p = kernel.normalizePath(nanoFileName, cwd, isRoot ? 'root' : user.username);
+      kernel.writeFile(p, nanoContent, isRoot ? 'root' : user.username);
     }
+    setNanoModified(false);
 
-    const existing = assets.find((a) => a.name.toLowerCase() === nanoFileName.toLowerCase());
+    // Save to company assets
     await onSaveAsset({
-      id: existing?.id || `file_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      id: `file_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
       company_id: company.id,
-      asset_type: nanoFileName.endsWith('.sheet.json') ? 'spreadsheet' : nanoFileName.endsWith('.excalidraw.json') ? 'whiteboard' : nanoFileName.endsWith('.doc.json') || nanoFileName.endsWith('.md') ? 'doc' : 'file',
+      asset_type: 'file',
       name: nanoFileName,
+      folder_path: cwd,
       content: nanoContent,
       size: nanoContent.length,
-      folder_path: cwd,
-      created_by: user.username,
+      created_by: isRoot ? 'root' : user.username,
       updated_at: new Date().toISOString(),
       scope: 'shared',
     });
 
-    setNanoModified(false);
     appendLog({
-      id: `out_nano_${Date.now()}`,
+      id: `out_${Date.now()}`,
       user: 'system',
       type: 'system',
-      text: `[nano] Saved "${nanoFileName}" (${nanoContent.split('\n').length} lines, ${nanoContent.length} bytes) to ${cwd}.`,
+      text: `[ Wrote ${nanoContent.length} bytes to ${nanoFileName} ]`,
       timestamp: new Date().toISOString(),
     });
   };
 
   const handleNanoExit = () => {
     setNanoActive(false);
-    setNanoFileName('');
-    setNanoContent('');
-    setNanoModified(false);
+    appendLog({
+      id: `out_${Date.now()}`,
+      user: 'system',
+      type: 'system',
+      text: `Exited nano editor. Returned to ${cwd}.`,
+      timestamp: new Date().toISOString(),
+    });
   };
 
   return (
-    <div className="flex-1 flex flex-col h-full bg-[#0d1117] text-slate-100 font-mono text-xs overflow-hidden select-text">
+    <div className="flex-1 flex flex-col h-full bg-[#0d1117] text-slate-100 font-mono text-xs select-text overflow-hidden">
       
-      {/* Linux Environment Top Bar */}
-      <div className="h-12 bg-[#161b22] border-b border-white/10 px-4 flex items-center justify-between shrink-0">
+      {/* Terminal Title Bar */}
+      <div className="bg-[#161b22] border-b border-white/10 px-4 py-2 flex items-center justify-between shrink-0 select-none">
         <div className="flex items-center space-x-3">
           <div className="flex items-center space-x-1.5">
-            <div className="w-3 h-3 rounded-full bg-rose-500/80 cursor-pointer hover:bg-rose-500" title="Close Shell" />
-            <div className="w-3 h-3 rounded-full bg-amber-500/80 cursor-pointer hover:bg-amber-500" title="Minimize" />
-            <div className="w-3 h-3 rounded-full bg-emerald-500/80 cursor-pointer hover:bg-emerald-500" title="Expand Fullscreen" />
+            <div className="w-3 h-3 rounded-full bg-rose-500/80 cursor-pointer" onClick={() => setLogs([])} title="Clear terminal" />
+            <div className="w-3 h-3 rounded-full bg-amber-500/80" />
+            <div className="w-3 h-3 rounded-full bg-emerald-500/80" />
           </div>
-          
-          <div className="h-4 w-px bg-white/10" />
 
-          <div className="flex items-center space-x-2">
-            <span className="font-bold text-white tracking-wide flex items-center">
-              <TerminalIcon className="w-4 h-4 text-emerald-400 mr-1.5" />
-              {hostname}
+          <div className="flex items-center space-x-2 text-slate-300 font-semibold text-xs">
+            <TerminalIcon className="w-4 h-4 text-emerald-400" />
+            <span>GNU/Linux Virtual Terminal</span>
+            <span className="text-[10px] text-slate-400 bg-slate-800 px-2 py-0.5 rounded-full border border-slate-700">
+              {isRoot ? 'root@' : `${user.username}@`}{hostname}
             </span>
-            <span className="px-2 py-0.5 rounded text-[10px] bg-emerald-500/20 text-emerald-400 font-semibold border border-emerald-500/30 flex items-center">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse mr-1.5" />
-              Wasm POSIX Subsystem
-            </span>
-            <span className="text-slate-400 text-[11px] hidden md:inline">
-              pwd: <span className="text-cyan-400">{cwd}</span>
-            </span>
+            {isRoot && (
+              <span className="text-[10px] font-bold text-rose-300 bg-rose-950/80 px-2 py-0.5 rounded-full border border-rose-800 flex items-center space-x-1">
+                <ShieldAlert className="w-3 h-3 text-rose-400" />
+                <span>ROOT PRIVILEGES</span>
+              </span>
+            )}
           </div>
         </div>
 
-        {/* Action Controls */}
-        <div className="flex items-center space-x-2">
-          {/* Export Org Backup Button */}
-          <button
-            onClick={() => executeCommand('export-org')}
-            className="flex items-center space-x-1.5 px-2.5 py-1 rounded bg-emerald-600/30 hover:bg-emerald-600/50 text-emerald-300 border border-emerald-500/30 transition-all font-sans text-[11px]"
-            title="Create Full Encrypted Organization Backup"
-          >
-            <Download className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">Export Org Backup</span>
-          </button>
+        <div className="flex items-center space-x-2 text-[11px] text-slate-400">
+          <span className="hidden sm:inline bg-slate-800/80 px-2 py-0.5 rounded border border-slate-700">
+            APT & Brew: <strong className="text-emerald-400 font-mono">{installedPackages.length} pkgs</strong>
+          </span>
 
-          {/* Open in GUI File Manager */}
           {onNavigateTab && (
             <button
               onClick={() => onNavigateTab('assets', cwd)}
-              className="flex items-center space-x-1.5 px-2.5 py-1 rounded bg-indigo-600/30 hover:bg-indigo-600/50 text-indigo-300 border border-indigo-500/30 transition-all font-sans text-[11px]"
-              title="Switch to GUI File Manager (Nautilus)"
+              className="flex items-center space-x-1 px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg transition"
+              title="Open current directory in Nautilus GUI"
             >
-              <FolderGit2 className="w-3.5 h-3.5" />
-              <span>File Manager GUI</span>
+              <FolderGit2 className="w-3.5 h-3.5 text-indigo-400" />
+              <span>Nautilus GUI</span>
             </button>
           )}
 
-          {/* Python Engine Status Badge */}
-          <button
-            onClick={() => !isPyodideReady && !isPyodideLoading && initPyodide()}
-            disabled={isPyodideReady || isPyodideLoading}
-            className={`flex items-center space-x-1.5 px-2.5 py-1 rounded border text-[11px] font-sans transition-all ${
-              isPyodideReady
-                ? 'bg-amber-500/10 border-amber-500/30 text-amber-300'
-                : isPyodideLoading
-                ? 'bg-blue-500/20 border-blue-500/40 text-blue-300 animate-pulse'
-                : 'bg-white/5 border-white/10 text-slate-300 hover:bg-white/10'
-            }`}
-            title="Python 3.12 WebAssembly Engine"
-          >
-            <Cpu className="w-3.5 h-3.5" />
-            <span>
-              {isPyodideReady ? 'Python 3.12 Ready' : isPyodideLoading ? 'Booting Linux Engine...' : 'Init Wasm Engine'}
-            </span>
-          </button>
-
-          {/* Clear Buffer */}
           <button
             onClick={() => setLogs([])}
-            className="p-1.5 rounded hover:bg-white/10 text-slate-400 hover:text-white transition-colors"
-            title="Clear Terminal Screen"
+            className="p-1 hover:text-white rounded hover:bg-slate-800 transition"
+            title="Clear Terminal Output"
           >
             <Trash2 className="w-3.5 h-3.5" />
           </button>
         </div>
       </div>
 
-      {/* Main Terminal Area or Nano Editor */}
+      {/* Main Terminal Viewport */}
       {nanoActive ? (
-        <div className="flex-1 flex flex-col bg-[#0b0e14] border-t border-white/10 select-text">
-          <div className="bg-slate-800 text-slate-200 px-4 py-1.5 flex items-center justify-between font-mono text-xs border-b border-white/10">
-            <span className="font-semibold text-emerald-400">
-              GNU nano 7.2 &nbsp;&nbsp;&nbsp;&nbsp; File: <span className="text-white underline">{nanoFileName}</span>
-              {nanoModified && <span className="text-amber-400 ml-2 font-bold">[Modified]</span>}
-            </span>
+        /* Nano Text Editor Screen */
+        <div className="flex-1 flex flex-col bg-[#05080f] select-text">
+          <div className="bg-slate-800 text-slate-200 px-4 py-1 flex items-center justify-between text-[11px] font-mono border-b border-white/10">
+            <span>GNU nano 7.2 &bull; File: <strong>{nanoFileName}</strong> {nanoModified && <span className="text-amber-400 font-bold">[Modified]</span>}</span>
             <div className="flex items-center space-x-2">
-              <button
-                onClick={handleNanoSave}
-                className="px-2.5 py-0.5 rounded bg-emerald-600 hover:bg-emerald-500 text-white font-sans text-[11px] font-semibold flex items-center"
-              >
-                <Save className="w-3 h-3 mr-1" />
-                Save (Ctrl+O)
+              <button onClick={handleNanoSave} className="flex items-center space-x-1 px-2 py-0.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded text-[10px] font-bold">
+                <Save className="w-3 h-3" />
+                <span>Save (^O)</span>
               </button>
-              <button
-                onClick={handleNanoExit}
-                className="px-2.5 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-white font-sans text-[11px] font-semibold flex items-center"
-              >
-                <X className="w-3 h-3 mr-1" />
-                Exit (Ctrl+X)
+              <button onClick={handleNanoExit} className="flex items-center space-x-1 px-2 py-0.5 bg-rose-600 hover:bg-rose-500 text-white rounded text-[10px] font-bold">
+                <X className="w-3 h-3" />
+                <span>Exit (^X)</span>
               </button>
             </div>
           </div>
@@ -1471,6 +843,7 @@ json.dumps(res)
           </div>
         </div>
       ) : (
+        /* Standard Linux Shell Screen */
         <div 
           onClick={handleContainerClick}
           className="flex-1 p-4 overflow-y-auto space-y-2 select-text cursor-text"
@@ -1507,6 +880,17 @@ json.dumps(res)
           <div className="flex items-center space-x-2 pt-1">
             {isPythonRepl ? (
               <span className="text-amber-400 font-bold shrink-0">&gt;&gt;&gt;&nbsp;</span>
+            ) : isNodeRepl ? (
+              <span className="text-emerald-400 font-bold shrink-0">&gt;&nbsp;</span>
+            ) : isRoot ? (
+              <span className="shrink-0 flex items-center space-x-1">
+                <span className="text-rose-500 font-bold">root</span>
+                <span className="text-slate-400">@</span>
+                <span className="text-cyan-400 font-bold">{hostname}</span>
+                <span className="text-slate-400">:</span>
+                <span className="text-blue-400 font-bold">{cwd}</span>
+                <span className="text-rose-500 font-bold">#</span>
+              </span>
             ) : (
               <span className="shrink-0 flex items-center space-x-1">
                 <span className="text-emerald-400 font-bold">{user.username}</span>
@@ -1539,18 +923,18 @@ json.dumps(res)
         <div className="flex items-center space-x-4">
           <span className="flex items-center">
             <span className="w-2 h-2 rounded-full bg-emerald-400 mr-1.5" />
-            Company: <strong className="text-white ml-1">{company.name}</strong>
+            Distro: <strong className="text-white ml-1">TheySynced Debian 6.8.0</strong>
           </span>
           <span className="hidden sm:inline">
             Mounted: <strong className="text-slate-300">/workspace (Encrypted POSIX)</strong>
           </span>
         </div>
         <div className="flex items-center space-x-3">
-          <span>Type &quot;export-org&quot; to backup</span>
+          <span>&quot;sudo apt install &lt;pkg&gt;&quot;</span>
           <span>&bull;</span>
-          <span>Type &quot;open &lt;file&gt;&quot; to visualize</span>
+          <span>&quot;brew install &lt;pkg&gt;&quot;</span>
           <span>&bull;</span>
-          <span>Shared Session</span>
+          <span>&quot;sudo su&quot;</span>
         </div>
       </div>
 
