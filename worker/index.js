@@ -991,6 +991,48 @@ export default {
           return jsonResponse({ success: true, message: 'Asset deleted' });
         }
 
+        // ── Workspace: Linux VM Bootstrap Shell Script (Mount /workspace)
+        if (url.pathname === '/api/workspace/bootstrap.sh') {
+          const companyId = url.searchParams.get('company_id') || 'comp_theysynced';
+          const assetRow = await db.prepare('SELECT data FROM ts_assets WHERE company_id = ?').bind(companyId).first();
+          const assets = assetRow ? JSON.parse(await decryptForOrg(null, assetRow.data, secret)) : [];
+
+          let sh = `#!/bin/bash
+# ==============================================================================
+# TheySynced Enterprise Linux Real VM Workspace Auto-Mount
+# Organization: ${companyId}
+# Generated: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+# ==============================================================================
+set -e
+echo "⚡ Initializing /workspace for organization [${companyId}]..."
+mkdir -p /workspace/chats /workspace/spreadsheets /workspace/drawings /workspace/docs /workspace/tasks /workspace/files /workspace/export
+
+`;
+
+          for (const a of assets) {
+            if (a.content && a.name) {
+              const targetFolder = a.folder_path ? (a.folder_path.startsWith('/workspace') ? a.folder_path : `/workspace${a.folder_path}`) : '/workspace/files';
+              const safeName = a.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+              sh += `mkdir -p "${targetFolder}"\n`;
+              const cleanContent = a.content.replace(/'/g, "'\\''");
+              sh += `cat << 'THEYSYNCED_EOF' > "${targetFolder}/${safeName}"\n${cleanContent}\nTHEYSYNCED_EOF\n`;
+            }
+          }
+
+          sh += `
+echo "✅ /workspace successfully mounted with company assets!"
+echo "Files in /workspace:"
+ls -la /workspace
+`;
+
+          return new Response(sh, {
+            headers: {
+              'Content-Type': 'text/plain; charset=utf-8',
+              'Access-Control-Allow-Origin': '*',
+            },
+          });
+        }
+
         // ── Chat: Messages List / History (Returns { success: true, messages: [...] })
         if (url.pathname === '/api/chat/messages' || url.pathname === '/api/chat/history') {
           const channelId = url.searchParams.get('channel_id') || url.searchParams.get('company_id') || 'comp_theysynced';
