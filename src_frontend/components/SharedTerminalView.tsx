@@ -52,6 +52,13 @@ export const SharedTerminalView: React.FC<SharedTerminalViewProps> = ({
 
   const hostname = `theysynced-${companySlug}`;
 
+  const isAdmin = useMemo(() => {
+    if (company.owner_id === user.id) return true;
+    return (company.members || []).some(
+      (m) => m.user_id === user.id && (m.role === 'Owner' || m.role === 'Admin')
+    );
+  }, [company.owner_id, company.members, user.id]);
+
   // Working Directory
   const [cwd, setCwd] = useState<string>(initialPath || '/workspace');
   const [inputVal, setInputVal] = useState<string>('');
@@ -328,7 +335,25 @@ os.environ['COMPANY_NAME'] = '${company.name}'
 
 os.chdir('/workspace')
 
-def posix_shell_execute(cmd_line, current_cwd, username, hostname):
+def check_permission(path, username, is_admin):
+    if is_admin:
+        return True, ""
+    norm = os.path.normpath(path).lower()
+    user_low = username.lower()
+
+    # 1. Other users' home directories (/home/<other>)
+    if norm.startswith('/home/') and not norm.startswith(f'/home/{user_low}'):
+        return False, f"bash: {path}: Permission denied (Private user home directory)"
+
+    # 2. Direct message chat logs (/workspace/chats/dm_... or dm-...)
+    if ('/workspace/chats/' in norm or norm.startswith('dm_') or norm.startswith('dm-')) and ('dm_' in norm or 'dm-' in norm):
+        fname = os.path.basename(norm)
+        if user_low not in fname:
+            return False, f"bash: {path}: Permission denied (Private direct message conversation)"
+
+    return True, ""
+
+def posix_shell_execute(cmd_line, current_cwd, username, hostname, is_admin=False):
     import os, sys, shutil, glob, shlex, re, json, csv, tarfile, zipfile, io, datetime, fnmatch
 
     cmd_line = cmd_line.strip()
@@ -367,13 +392,16 @@ def posix_shell_execute(cmd_line, current_cwd, username, hostname):
         pipe_stages = [s.strip() for s in cmd_line.split('|')]
         pipe_input = ""
         for stage in pipe_stages:
-            res = posix_shell_single(stage, os.getcwd(), username, hostname, pipe_input)
+            res = posix_shell_single(stage, os.getcwd(), username, hostname, pipe_input, is_admin)
             pipe_input = res.get("output", "")
             if res.get("error"):
                 return {"output": "", "error": res["error"], "new_cwd": os.getcwd(), "open_tab": None, "open_id": None}
         
         final_out = pipe_input
         if redir_file:
+            allowed, p_err = check_permission(redir_file, username, is_admin)
+            if not allowed:
+                return {"output": "", "error": p_err, "new_cwd": os.getcwd(), "open_tab": None, "open_id": None}
             mode = 'a' if redir_append else 'w'
             with open(redir_file, mode) as f:
                 f.write(final_out if final_out.endswith('\\n') else final_out + '\\n')
@@ -381,10 +409,13 @@ def posix_shell_execute(cmd_line, current_cwd, username, hostname):
         return {"output": final_out, "error": "", "new_cwd": os.getcwd(), "open_tab": None, "open_id": None}
 
     # Single command
-    res = posix_shell_single(cmd_line, os.getcwd(), username, hostname, "")
+    res = posix_shell_single(cmd_line, os.getcwd(), username, hostname, "", is_admin)
     out = res.get("output", "")
 
     if redir_file and out:
+        allowed, p_err = check_permission(redir_file, username, is_admin)
+        if not allowed:
+            return {"output": "", "error": p_err, "new_cwd": os.getcwd(), "open_tab": None, "open_id": None}
         mode = 'a' if redir_append else 'w'
         with open(redir_file, mode) as f:
             f.write(out if out.endswith('\\n') else out + '\\n')
@@ -392,7 +423,7 @@ def posix_shell_execute(cmd_line, current_cwd, username, hostname):
 
     return res
 
-def posix_shell_single(cmd_str, cwd, username, hostname, stdin_data=""):
+def posix_shell_single(cmd_str, cwd, username, hostname, stdin_data="", is_admin=False):
     import os, sys, shutil, glob, shlex, re, json, csv, tarfile, zipfile, io, datetime, fnmatch
 
     try:
@@ -415,6 +446,9 @@ def posix_shell_single(cmd_str, cwd, username, hostname, stdin_data=""):
         target = args[0] if args else '/workspace'
         if target == '~':
             target = f'/home/{username}'
+        allowed, p_err = check_permission(target, username, is_admin)
+        if not allowed:
+            return {"output": "", "error": p_err, "new_cwd": cwd}
         try:
             os.chdir(target)
             new_path = os.getcwd()
@@ -430,8 +464,19 @@ def posix_shell_single(cmd_str, cwd, username, hostname, stdin_data=""):
         targets = [a for a in args if not a.startswith('-')]
         target_dir = targets[0] if targets else '.'
 
+        allowed, p_err = check_permission(target_dir, username, is_admin)
+        if not allowed:
+            return {"output": "", "error": p_err, "new_cwd": cwd}
+
         try:
             entries = os.listdir(target_dir)
+            if not is_admin:
+                target_abs = os.path.abspath(target_dir).lower()
+                if target_abs == '/home':
+                    entries = [e for e in entries if e.lower() == username.lower()]
+                elif 'chats' in target_abs:
+                    entries = [e for e in entries if not (e.lower().startswith('dm_') or e.lower().startswith('dm-')) or username.lower() in e.lower()]
+
             if show_all:
                 entries = ['.', '..'] + entries
             entries.sort()
@@ -443,7 +488,8 @@ def posix_shell_single(cmd_str, cwd, username, hostname, stdin_data=""):
                     try:
                         st = os.stat(entry_path)
                         is_dir = os.path.isdir(entry_path)
-                        perm = ('d' if is_dir else '-') + 'rwxr-xr-x'
+                        is_dm_or_priv = 'dm_' in entry.lower() or 'dm-' in entry.lower() or entry.lower() == username.lower()
+                        perm = ('d' if is_dir else '-') + ('rwx------' if is_dm_or_priv else 'rwxr-xr-x')
                         size = str(st.st_size).rjust(8)
                         dt = datetime.datetime.fromtimestamp(st.st_mtime).strftime('%b %d %H:%M')
                         display_name = f"{entry}/" if is_dir else entry
@@ -470,6 +516,9 @@ def posix_shell_single(cmd_str, cwd, username, hostname, stdin_data=""):
             return {"output": "", "error": "cat: missing file operand", "new_cwd": cwd}
         output_chunks = []
         for file_path in args:
+            allowed, p_err = check_permission(file_path, username, is_admin)
+            if not allowed:
+                return {"output": "", "error": p_err, "new_cwd": cwd}
             try:
                 with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
                     output_chunks.append(f.read())
@@ -953,6 +1002,16 @@ Swap:              0           0           0""", "error": "", "new_cwd": cwd}
         appendLog({ id: `err_${Date.now()}`, user: 'system', type: 'error', text: 'nano: missing file name to edit.', timestamp: new Date().toISOString() });
         return;
       }
+
+      // Permission check for DM chats or restricted files
+      const lowerFile = fileName.toLowerCase();
+      if ((lowerFile.startsWith('dm_') || lowerFile.startsWith('dm-')) && !isAdmin) {
+        if (!lowerFile.includes(user.username.toLowerCase())) {
+          appendLog({ id: `err_${Date.now()}`, user: 'system', type: 'error', text: `nano: ${fileName}: Permission denied (Private direct message conversation)`, timestamp: new Date().toISOString() });
+          return;
+        }
+      }
+
       // Read file if exists
       let existingContent = '';
       if (pyodideRef.current && pyodideRef.current.FS) {
@@ -1034,10 +1093,11 @@ Unified Operating System Commands:
       const safeCwd = JSON.stringify(cwd);
       const safeUser = JSON.stringify(user.username);
       const safeHost = JSON.stringify(hostname);
+      const safeIsAdmin = isAdmin ? 'True' : 'False';
 
       const execCode = `
 import json
-res = posix_shell_execute(${safeCmd}, ${safeCwd}, ${safeUser}, ${safeHost})
+res = posix_shell_execute(${safeCmd}, ${safeCwd}, ${safeUser}, ${safeHost}, ${safeIsAdmin})
 json.dumps(res)
 `;
       const resultJsonStr = await pyodide.runPythonAsync(execCode);

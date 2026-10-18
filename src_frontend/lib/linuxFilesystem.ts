@@ -5,7 +5,7 @@ export interface LinuxFileEntry {
   name: string;           // e.g. general.log
   folder: string;         // e.g. /workspace/chats
   type: 'file' | 'folder';
-  category: 'chat' | 'spreadsheet' | 'drawing' | 'doc' | 'file' | 'export' | 'system';
+  category: 'chat' | 'spreadsheet' | 'drawing' | 'doc' | 'file' | 'export' | 'system' | 'home';
   content?: string;
   size?: number;
   url?: string;
@@ -14,6 +14,37 @@ export interface LinuxFileEntry {
   asset_id?: string;
   target_tab?: 'teams' | 'spreadsheet' | 'whiteboard' | 'docs' | 'assets';
   target_id?: string;
+  scope?: 'shared' | 'private' | 'dm';
+  allowed_users?: string[];
+  mode?: string;          // POSIX permission mode string, e.g. -rw-------
+}
+
+/**
+ * Check if the active user has Admin / Owner privileges in the organization
+ */
+export function isUserCompanyAdmin(company: Company, user: UserProfile): boolean {
+  if (company.owner_id === user.id) return true;
+  return (company.members || []).some(
+    (m) => m.user_id === user.id && (m.role === 'Owner' || m.role === 'Admin')
+  );
+}
+
+/**
+ * Check if a DM team channel involves the specified user
+ */
+export function isUserParticipantInDm(team: Team, messages: ChatMessage[], user: UserProfile): boolean {
+  const lowerName = team.name.toLowerCase();
+  const lowerUser = user.username.toLowerCase();
+
+  // 1. Direct name match in channel title (e.g. "DM:aryan & humaira" or "dm-aryan-humaira")
+  if (lowerName.includes(lowerUser)) return true;
+
+  // 2. Check if team messages contain messages from this user or sent to this user
+  if (messages.some((m) => m.team_id === team.id && (m.username?.toLowerCase() === lowerUser || m.user_id === user.id))) {
+    return true;
+  }
+
+  return false;
 }
 
 /**
@@ -60,14 +91,12 @@ export function gridToCsv(grid: string[][]): string {
 }
 
 /**
- * Build unified Linux Filesystem representing all Company data:
- * - /workspace/chats/ (All channels and DMs as readable logs & json)
- * - /workspace/spreadsheets/ (All spreadsheet data as CSV & JSON)
- * - /workspace/drawings/ (All Excalidraw canvases as JSON)
- * - /workspace/docs/ (All documents as Markdown & HTML)
- * - /workspace/files/ (All company shared and uploaded files)
- * - /workspace/export/ (Full organization export archives)
- * - /etc/theysynced/ (Organization configuration, security policy, & members)
+ * Build unified, permission-hardened Linux Filesystem representing all Company data.
+ * SECURITY GUARANTEE:
+ * - Direct Message (DM) chat files are strictly limited to the participating users and Admins.
+ *   Unauthorized users will NOT see or have files mounted for DMs they do not belong to.
+ * - Private assets and user home folders (/home/<username>) are restricted strictly to that user and Admin.
+ * - Standard company shared files in /workspace/ are accessible across the organization.
  */
 export function buildCompanyLinuxFilesystem(
   company: Company,
@@ -79,8 +108,10 @@ export function buildCompanyLinuxFilesystem(
   const entries: LinuxFileEntry[] = [];
   const virtualAssets: WorkspaceAsset[] = [];
   const now = new Date().toISOString();
+  const isAdmin = isUserCompanyAdmin(company, user);
+  const currentUsernameLower = user.username.toLowerCase();
 
-  // Root Directories
+  // 1. Root & Workspace Directories
   const rootFolders = ['chats', 'spreadsheets', 'drawings', 'docs', 'files', 'export'];
   rootFolders.forEach((rf) => {
     entries.push({
@@ -91,16 +122,40 @@ export function buildCompanyLinuxFilesystem(
       category: rf as any,
       updated_at: now,
       created_by: 'system',
+      mode: 'drwxr-xr-x',
     });
   });
 
-  // 1. CHATS -> /workspace/chats/<channel>.log and .chat.json
+  // User Home Directory (/home/<username>) - strictly private (0700)
+  entries.push({
+    path: `/home/${user.username}`,
+    name: user.username,
+    folder: '/home',
+    type: 'folder',
+    category: 'home',
+    updated_at: now,
+    created_by: user.username,
+    scope: 'private',
+    mode: 'drwx------',
+  });
+
+  // 2. CHATS -> /workspace/chats/<channel>.log and .chat.json
   const activeTeams = teams.length > 0 ? teams : [
     { id: `team_${company.id}_gen`, company_id: company.id, name: 'General', description: 'General discussions', created_at: now }
   ];
 
   activeTeams.forEach((t) => {
-    const isDm = t.name.startsWith('DM:');
+    const isDm = t.name.startsWith('DM:') || t.name.startsWith('dm-');
+    
+    // ACL Check: If this is a DM channel, only participants and Admins can access it
+    if (isDm && !isAdmin) {
+      const userAllowed = isUserParticipantInDm(t, messages, user);
+      if (!userAllowed) {
+        // Unauthorized: current user is not in this DM. Strictly exclude from filesystem.
+        return;
+      }
+    }
+
     const cleanName = (isDm ? t.name.replace('DM:', 'dm-') : t.name)
       .toLowerCase()
       .replace(/[^a-z0-9_-]/g, '_');
@@ -111,7 +166,6 @@ export function buildCompanyLinuxFilesystem(
       return false;
     });
 
-    // Formatted readable log
     const logLines = channelMsgs.map((m) => {
       const ts = m.timestamp ? new Date(m.timestamp).toISOString().replace('T', ' ').substring(0, 19) : now.substring(0, 19);
       let line = `[${ts}] <${m.username}> ${m.message}`;
@@ -122,7 +176,7 @@ export function buildCompanyLinuxFilesystem(
     });
 
     const logContent = logLines.length > 0
-      ? `# TheySynced Chat Log: #${t.name}\n# Channel ID: ${t.id}\n# Total Messages: ${channelMsgs.length}\n\n` + logLines.join('\n') + '\n'
+      ? `# TheySynced Chat Log: #${t.name}\n# Channel ID: ${t.id}\n# Total Messages: ${channelMsgs.length}\n# Security Scope: ${isDm ? 'Private DM (Restricted)' : 'Company Shared'}\n\n` + logLines.join('\n') + '\n'
       : `# TheySynced Chat Log: #${t.name}\n# Channel ID: ${t.id}\n(No messages recorded yet)\n`;
 
     const jsonContent = JSON.stringify(channelMsgs, null, 2);
@@ -137,7 +191,9 @@ export function buildCompanyLinuxFilesystem(
       content: logContent,
       size: logContent.length,
       updated_at: channelMsgs[channelMsgs.length - 1]?.timestamp || now,
-      created_by: 'theysynced-chat',
+      created_by: isDm ? 'Private DM' : 'theysynced-chat',
+      scope: isDm ? 'dm' : 'shared',
+      mode: isDm ? '-rw-------' : '-rw-r--r--',
       target_tab: 'teams',
       target_id: t.id,
     });
@@ -152,7 +208,9 @@ export function buildCompanyLinuxFilesystem(
       content: jsonContent,
       size: jsonContent.length,
       updated_at: channelMsgs[channelMsgs.length - 1]?.timestamp || now,
-      created_by: 'theysynced-chat',
+      created_by: isDm ? 'Private DM' : 'theysynced-chat',
+      scope: isDm ? 'dm' : 'shared',
+      mode: isDm ? '-rw-------' : '-rw-r--r--',
       target_tab: 'teams',
       target_id: t.id,
     });
@@ -163,20 +221,19 @@ export function buildCompanyLinuxFilesystem(
       company_id: company.id,
       asset_type: 'file',
       name: `${cleanName}.log`,
-      folder_path: '/Chat Logs',
-      parent_id: 'v_chat_attachments',
+      folder_path: isDm ? '/Chat Attachments/Direct Messages' : '/Chat Logs',
+      parent_id: 'v_linux_chats',
       content: logContent,
       size: logContent.length,
-      created_by: 'Chat Service',
+      created_by: isDm ? 'Private DM' : 'Chat Service',
       updated_at: channelMsgs[channelMsgs.length - 1]?.timestamp || now,
       scope: isDm ? 'dm' : 'shared',
     });
   });
 
-  // 2. SPREADSHEETS -> /workspace/spreadsheets/<title>.sheet.json & .csv
+  // 3. SPREADSHEETS -> /workspace/spreadsheets/<title>.sheet.json & .csv
   const sheetAssets = assets.filter((a) => a.asset_type === 'spreadsheet');
   if (sheetAssets.length === 0) {
-    // Default enterprise financial sheet
     const defaultData = [
       ['Teammate', 'Q1 Target', 'Q2 Target', 'Q3 Target', 'Annual Target'],
       ['Aryan Rao', '12000', '14000', '18000', '44000'],
@@ -196,6 +253,8 @@ export function buildCompanyLinuxFilesystem(
       size: csv.length,
       updated_at: now,
       created_by: user.username,
+      scope: 'shared',
+      mode: '-rw-r--r--',
       target_tab: 'spreadsheet',
       target_id: `spreadsheet_${company.id}`,
     });
@@ -210,11 +269,18 @@ export function buildCompanyLinuxFilesystem(
       size: jsonStr.length,
       updated_at: now,
       created_by: user.username,
+      scope: 'shared',
+      mode: '-rw-r--r--',
       target_tab: 'spreadsheet',
       target_id: `spreadsheet_${company.id}`,
     });
   } else {
     sheetAssets.forEach((sa) => {
+      // Permission check: if private, only creator and Admin
+      if (sa.scope === 'private' && !isAdmin && sa.created_by.toLowerCase() !== currentUsernameLower) {
+        return;
+      }
+
       const cleanName = (sa.name || 'sheet')
         .toLowerCase()
         .replace(/[^a-z0-9_-]/g, '_')
@@ -241,6 +307,8 @@ export function buildCompanyLinuxFilesystem(
         updated_at: sa.updated_at || now,
         created_by: sa.created_by || user.username,
         asset_id: sa.id,
+        scope: sa.scope || 'shared',
+        mode: sa.scope === 'private' ? '-rw-------' : '-rw-r--r--',
         target_tab: 'spreadsheet',
         target_id: sa.id,
       });
@@ -256,13 +324,15 @@ export function buildCompanyLinuxFilesystem(
         updated_at: sa.updated_at || now,
         created_by: sa.created_by || user.username,
         asset_id: sa.id,
+        scope: sa.scope || 'shared',
+        mode: sa.scope === 'private' ? '-rw-------' : '-rw-r--r--',
         target_tab: 'spreadsheet',
         target_id: sa.id,
       });
     });
   }
 
-  // 3. DRAWINGS -> /workspace/drawings/<title>.excalidraw.json
+  // 4. DRAWINGS -> /workspace/drawings/<title>.excalidraw.json
   const whiteboardAssets = assets.filter((a) => a.asset_type === 'whiteboard');
   if (whiteboardAssets.length === 0) {
     const defaultJson = JSON.stringify({ type: 'excalidraw', version: 2, elements: [], appState: { theme: 'light' } }, null, 2);
@@ -276,11 +346,17 @@ export function buildCompanyLinuxFilesystem(
       size: defaultJson.length,
       updated_at: now,
       created_by: user.username,
+      scope: 'shared',
+      mode: '-rw-r--r--',
       target_tab: 'whiteboard',
       target_id: `excalidraw_${company.id}`,
     });
   } else {
     whiteboardAssets.forEach((wa) => {
+      if (wa.scope === 'private' && !isAdmin && wa.created_by.toLowerCase() !== currentUsernameLower) {
+        return;
+      }
+
       const cleanName = (wa.name || 'drawing')
         .toLowerCase()
         .replace(/[^a-z0-9_-]/g, '_')
@@ -297,13 +373,15 @@ export function buildCompanyLinuxFilesystem(
         updated_at: wa.updated_at || now,
         created_by: wa.created_by || user.username,
         asset_id: wa.id,
+        scope: wa.scope || 'shared',
+        mode: wa.scope === 'private' ? '-rw-------' : '-rw-r--r--',
         target_tab: 'whiteboard',
         target_id: wa.id,
       });
     });
   }
 
-  // 4. DOCS -> /workspace/docs/<title>.md & .doc.html
+  // 5. DOCS -> /workspace/docs/<title>.md & .doc.html
   const docAssets = assets.filter((a) => a.asset_type === 'doc');
   if (docAssets.length === 0) {
     const defaultMd = `# ${company.name} Workspace Master Document\n\nWelcome to your organization's unified knowledgebase. This document is fully synchronized with your company's Linux filesystem.\n`;
@@ -317,11 +395,17 @@ export function buildCompanyLinuxFilesystem(
       size: defaultMd.length,
       updated_at: now,
       created_by: user.username,
+      scope: 'shared',
+      mode: '-rw-r--r--',
       target_tab: 'docs',
       target_id: `doc_${company.id}`,
     });
   } else {
     docAssets.forEach((da) => {
+      if (da.scope === 'private' && !isAdmin && da.created_by.toLowerCase() !== currentUsernameLower) {
+        return;
+      }
+
       const cleanName = (da.name || 'document')
         .toLowerCase()
         .replace(/[^a-z0-9_-]/g, '_')
@@ -340,17 +424,64 @@ export function buildCompanyLinuxFilesystem(
         updated_at: da.updated_at || now,
         created_by: da.created_by || user.username,
         asset_id: da.id,
+        scope: da.scope || 'shared',
+        mode: da.scope === 'private' ? '-rw-------' : '-rw-r--r--',
         target_tab: 'docs',
         target_id: da.id,
       });
     });
   }
 
-  // 5. FILES & STORAGE -> /workspace/files/...
+  // 6. FILES & STORAGE -> /workspace/files/... & /home/<username>/
   const standardFiles = assets.filter((a) => a.asset_type === 'file' || a.asset_type === 'pdf');
   standardFiles.forEach((sf) => {
-    // Avoid double-listing system logs or synthetic files
     if (sf.id.startsWith('terminal_') || sf.id.startsWith('chat_asset_')) return;
+
+    // Permission checks
+    if (sf.scope === 'private') {
+      if (!isAdmin && sf.created_by.toLowerCase() !== currentUsernameLower) {
+        return; // Exclude other users' private files
+      }
+      // Place in user's personal home directory
+      entries.push({
+        path: `/home/${user.username}/${sf.name}`,
+        name: sf.name,
+        folder: `/home/${user.username}`,
+        type: 'file',
+        category: 'home',
+        content: sf.content,
+        size: sf.size || (sf.content ? sf.content.length : 1024),
+        url: sf.url,
+        updated_at: sf.updated_at || now,
+        created_by: sf.created_by,
+        asset_id: sf.id,
+        scope: 'private',
+        mode: '-rw-------',
+        target_tab: 'assets',
+        target_id: sf.id,
+      });
+      return;
+    }
+
+    if (sf.allowed_users && sf.allowed_users.length > 0) {
+      if (!isAdmin && !sf.allowed_users.some((u) => u.toLowerCase() === currentUsernameLower)) {
+        return; // Exclude restricted files
+      }
+    }
+
+    // Check if it is a DM attachment
+    if (sf.scope === 'dm' || sf.folder_path?.includes('/Direct Messages/')) {
+      if (!isAdmin) {
+        const dmMatch = sf.folder_path?.match(/@([a-zA-Z0-9_.-]+)\s*&\s*@([a-zA-Z0-9_.-]+)/);
+        if (dmMatch) {
+          const u1 = dmMatch[1].toLowerCase();
+          const u2 = dmMatch[2].toLowerCase();
+          if (currentUsernameLower !== u1 && currentUsernameLower !== u2) {
+            return; // Exclude private DM attachment
+          }
+        }
+      }
+    }
 
     entries.push({
       path: `/workspace/files/${sf.name}`,
@@ -364,12 +495,14 @@ export function buildCompanyLinuxFilesystem(
       updated_at: sf.updated_at || now,
       created_by: sf.created_by || user.username,
       asset_id: sf.id,
+      scope: sf.scope || 'shared',
+      mode: '-rw-r--r--',
       target_tab: 'assets',
       target_id: sf.id,
     });
   });
 
-  // 6. SYSTEM METADATA -> /etc/theysynced/
+  // 7. SYSTEM METADATA -> /etc/theysynced/
   const orgMeta = JSON.stringify({
     organization_id: company.id,
     organization_name: company.name,
@@ -396,6 +529,7 @@ export function buildCompanyLinuxFilesystem(
     size: orgMeta.length,
     updated_at: now,
     created_by: 'system',
+    mode: '-rw-r--r--',
   });
 
   entries.push({
@@ -408,6 +542,7 @@ export function buildCompanyLinuxFilesystem(
     size: membersRoster.length,
     updated_at: now,
     created_by: 'system',
+    mode: '-rw-r--r--',
   });
 
   return { entries, virtualAssets };
