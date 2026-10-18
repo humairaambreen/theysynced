@@ -89,11 +89,19 @@ export interface WorkspaceAsset {
   id: string;
   company_id: string;
   team_id?: string;
-  asset_type: 'whiteboard' | 'spreadsheet' | 'doc' | 'pdf';
+  asset_type: 'whiteboard' | 'spreadsheet' | 'doc' | 'pdf' | 'file' | 'folder';
   name: string;
-  content: string;
+  content?: string;
   created_by: string;
   updated_at: string;
+  folder_id?: string | null;
+  folder_path?: string;
+  parent_id?: string | null;
+  file_type?: string;
+  size?: number;
+  url?: string;
+  scope?: 'shared' | 'private' | 'dm';
+  allowed_users?: string[] | null;
 }
 
 export interface CallParticipant {
@@ -105,5 +113,6 @@ export interface CallParticipant {
   joined_at: string;
 }
 
-export type ActiveTab = 'overview' | 'teams' | 'whiteboard' | 'spreadsheet' | 'docs' | 'activity' | 'rdp';
+export type ActiveTab = 'overview' | 'teams' | 'rdp' | 'whiteboard' | 'spreadsheet' | 'docs' | 'assets' | 'activity';
+
 

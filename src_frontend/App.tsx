@@ -7,6 +7,7 @@ import { ChatView } from './components/ChatView';
 import { ExcalidrawBoard } from './components/ExcalidrawBoard';
 import { SpreadsheetView } from './components/SpreadsheetView';
 import { DocsView } from './components/DocsView';
+import { SharedAssetsView } from './components/SharedAssetsView';
 import { ActivityHubView } from './components/ActivityHubView';
 import { AuthModal } from './components/AuthModal';
 import { CompanyModal } from './components/CompanyModal';
@@ -50,6 +51,100 @@ export default function App() {
 
   const [screenSeconds, setScreenSeconds] = useState(0);
   const currentChannelIdRef = useRef<string | undefined>(undefined);
+
+  // Synchronize browser URL with current workspace state without reload
+  const syncUrl = (tab: ActiveTab, teamId?: string, currentTeams?: Team[]) => {
+    if (typeof window === 'undefined') return;
+    let path = '/';
+    const list = currentTeams || teams;
+
+    if (tab === 'overview') {
+      path = '/';
+    } else if (tab === 'teams') {
+      const activeId = teamId || activeTeamId;
+      const targetTeam = list.find((t) => t.id === activeId);
+      if (targetTeam) {
+        if (targetTeam.name.startsWith('DM:')) {
+          const cleanDm = targetTeam.name.replace('DM:', 'dm-').toLowerCase();
+          path = `/chat/${encodeURIComponent(cleanDm)}`;
+        } else {
+          path = `/chat/${encodeURIComponent(targetTeam.name.toLowerCase())}`;
+        }
+      } else {
+        path = '/chat/general';
+      }
+    } else if (tab === 'assets') {
+      path = '/assets';
+    } else if (tab === 'whiteboard') {
+      path = '/whiteboard';
+    } else if (tab === 'spreadsheet') {
+      path = '/spreadsheet';
+    } else if (tab === 'docs') {
+      path = '/docs';
+    } else if (tab === 'rdp') {
+      path = '/rdp';
+    } else if (tab === 'activity') {
+      path = '/activity';
+    }
+
+    if (window.location.pathname !== path) {
+      window.history.pushState(null, '', path);
+    }
+  };
+
+  // Parse path on initial load or browser back/forward (popstate)
+  const handleRouteFromPath = (path: string, currentTeams: Team[]) => {
+    const clean = path.replace(/^\/+/, '').split('/');
+    const section = clean[0]?.toLowerCase() || '';
+    const param = clean[1] ? decodeURIComponent(clean[1]).toLowerCase() : '';
+
+    if (section === 'chat') {
+      setActiveTab('teams');
+      if (param && currentTeams.length > 0) {
+        const found = currentTeams.find((t) => {
+          if (t.id.toLowerCase() === param) return true;
+          if (t.name.toLowerCase() === param) return true;
+          if (t.name.toLowerCase() === `dm:${param.replace(/^dm-/, '')}`) return true;
+          return false;
+        });
+        if (found) {
+          setActiveTeamId(found.id);
+        }
+      }
+    } else if (section === 'assets' || section === 'storage') {
+      setActiveTab('assets');
+    } else if (section === 'whiteboard' || section === 'excalidraw') {
+      setActiveTab('whiteboard');
+    } else if (section === 'spreadsheet' || section === 'sheets') {
+      setActiveTab('spreadsheet');
+    } else if (section === 'docs') {
+      setActiveTab('docs');
+    } else if (section === 'rdp') {
+      setActiveTab('rdp');
+    } else if (section === 'activity') {
+      setActiveTab('activity');
+    } else if (section === 'overview' || !section) {
+      setActiveTab('overview');
+    }
+  };
+
+  // Popstate event listener for browser Back/Forward navigation
+  useEffect(() => {
+    const onPopState = () => {
+      handleRouteFromPath(window.location.pathname, teams);
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, [teams]);
+
+  // Initial URL check once teams are loaded or on mount
+  const hasInitializedRouteRef = useRef(false);
+  useEffect(() => {
+    if (teams.length > 0 && !hasInitializedRouteRef.current) {
+      hasInitializedRouteRef.current = true;
+      handleRouteFromPath(window.location.pathname, teams);
+    }
+  }, [teams]);
 
   useEffect(() => {
     currentChannelIdRef.current = activeTeamId || activeCompany?.id;
@@ -464,6 +559,8 @@ export default function App() {
           type: 'chat',
           message: text,
           team_id: targetTeamId,
+          user_id: user.id,
+          username: user.username,
           file_attachment: attachment,
         })
       );
@@ -477,6 +574,8 @@ export default function App() {
             token,
             channel_id: targetTeamId,
             company_id: activeCompany.id,
+            user_id: user.id,
+            username: user.username,
             message: text,
             file_attachment: attachment,
           }),
@@ -487,6 +586,9 @@ export default function App() {
             if (prev.some((m) => m.id === data.message.id)) return prev;
             return [...prev, data.message];
           });
+          if (attachment) {
+            fetchAssets(token, activeCompany.id);
+          }
         }
       } catch (err) {
         console.error("Failed to save chat message via HTTP fallback:", err);
@@ -506,6 +608,7 @@ export default function App() {
       if (data.success && data.team) {
         setTeams((prev) => [...prev, data.team]);
         setActiveTeamId(data.team.id);
+        syncUrl('teams', data.team.id);
       }
     } catch (e) {
       // fallback local
@@ -518,6 +621,7 @@ export default function App() {
       };
       setTeams((prev) => [...prev, newT]);
       setActiveTeamId(newT.id);
+      syncUrl('teams', newT.id);
     }
   };
 
@@ -537,24 +641,67 @@ export default function App() {
   };
 
 
-  const handleSaveAsset = async (name: string, content: string) => {
+  const handleSaveAsset = async (nameOrAsset: string | Partial<WorkspaceAsset>, content?: string, scope?: 'shared' | 'private') => {
     if (!token || !activeCompany || !user) return;
-    const assetType = activeTab === 'whiteboard' ? 'whiteboard' : activeTab === 'spreadsheet' ? 'spreadsheet' : 'doc';
-    const asset: WorkspaceAsset = {
-      id: `${assetType}_${activeCompany.id}`,
-      company_id: activeCompany.id,
-      asset_type: assetType,
-      name,
-      content,
-      created_by: user.username,
-      updated_at: new Date().toISOString(),
-    };
-    setAssets((prev) => [...prev.filter((a) => a.id !== asset.id), asset]);
+    
+    let assetToSave: WorkspaceAsset;
+    if (typeof nameOrAsset === 'object') {
+      assetToSave = {
+        id: nameOrAsset.id || `asset_${Date.now()}`,
+        company_id: activeCompany.id,
+        asset_type: nameOrAsset.asset_type || 'file',
+        name: nameOrAsset.name || 'Untitled',
+        content: nameOrAsset.content || '',
+        created_by: nameOrAsset.created_by || user.username,
+        updated_at: new Date().toISOString(),
+        folder_id: nameOrAsset.folder_id,
+        folder_path: nameOrAsset.folder_path,
+        parent_id: nameOrAsset.parent_id,
+        file_type: nameOrAsset.file_type,
+        size: nameOrAsset.size,
+        url: nameOrAsset.url,
+        scope: nameOrAsset.scope || 'shared',
+        allowed_users: nameOrAsset.allowed_users,
+      };
+    } else {
+      const assetType = activeTab === 'whiteboard' ? 'whiteboard' : activeTab === 'spreadsheet' ? 'spreadsheet' : 'doc';
+      const assetId = scope === 'private' 
+        ? `${assetType}_${activeCompany.id}_user_${user.id}` 
+        : `${assetType}_${activeCompany.id}`;
+
+      assetToSave = {
+        id: assetId,
+        company_id: activeCompany.id,
+        asset_type: assetType,
+        name: nameOrAsset,
+        content: content || '',
+        created_by: user.username,
+        updated_at: new Date().toISOString(),
+        scope: scope || 'shared',
+      };
+    }
+
+    setAssets((prev) => [...prev.filter((a) => a.id !== assetToSave.id), assetToSave]);
+
     try {
       await fetch('/api/assets/save', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token, company_id: activeCompany.id, asset }),
+        body: JSON.stringify({ token, company_id: activeCompany.id, asset: assetToSave }),
+      });
+    } catch (e) {
+      // ignore
+    }
+  };
+
+  const handleDeleteAsset = async (assetId: string) => {
+    if (!token || !activeCompany) return;
+    setAssets((prev) => prev.filter((a) => a.id !== assetId && a.parent_id !== assetId && a.folder_id !== assetId));
+    try {
+      await fetch('/api/assets/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token, company_id: activeCompany.id, id: assetId }),
       });
     } catch (e) {
       // ignore
@@ -567,19 +714,25 @@ export default function App() {
     if (tab === 'teams') {
       if (teamId) {
         setActiveTeamId(teamId);
+        syncUrl('teams', teamId);
       } else if (memberUsername && user) {
         const sorted = [user.username, memberUsername].sort();
         const dmTeamName = `DM:${sorted[0]}-${sorted[1]}`;
         const existing = teams.find((t) => t.name === dmTeamName);
         if (existing) {
           setActiveTeamId(existing.id);
+          syncUrl('teams', existing.id);
         } else {
           const desc = memberUsername === user.username
             ? 'Personal notebook & saved messages'
             : `Direct 1-on-1 messaging between @${sorted[0]} and @${sorted[1]}`;
           handleCreateTeam(dmTeamName, desc);
         }
+      } else {
+        syncUrl('teams');
       }
+    } else {
+      syncUrl(tab as ActiveTab);
     }
   };
 
@@ -753,7 +906,7 @@ export default function App() {
       <div className="flex-1 flex flex-col lg:flex-row overflow-hidden">
         
         {/* Navigation Sidebar */}
-        <Sidebar activeTab={activeTab} onTabChange={(t) => setActiveTab(t)} />
+        <Sidebar activeTab={activeTab} onTabChange={(t) => { setActiveTab(t); syncUrl(t); }} />
 
         <div className="flex-1 flex flex-col overflow-hidden">
           {showInactivityWarning && (
@@ -776,7 +929,7 @@ export default function App() {
           {/* Dynamic Tab Views */}
           <main className={`flex-1 flex flex-col overflow-hidden pb-24 lg:pb-0 ${activeTab === 'overview' ? 'overflow-y-auto' : ''}`}>
           {activeTab === 'overview' && (
-            <OfficeOverviewGrid company={activeCompany} onNavigateTab={(t) => setActiveTab(t)} />
+            <OfficeOverviewGrid company={activeCompany} onNavigateTab={(t) => { setActiveTab(t); syncUrl(t); }} />
           )}
 
           {activeTab === 'teams' && activeCompany && (
@@ -789,13 +942,21 @@ export default function App() {
               onCreateTeam={handleCreateTeam}
               onDeleteTeam={handleDeleteTeam}
               selectedTeamId={activeTeamId}
-              onSelectTeam={(teamId) => setActiveTeamId(teamId)}
+              onSelectTeam={(teamId) => { setActiveTeamId(teamId); syncUrl('teams', teamId); }}
               websocket={websocket}
             />
           )}
 
-
-
+          {activeTab === 'assets' && activeCompany && (
+            <SharedAssetsView
+              user={user}
+              company={activeCompany}
+              assets={assets}
+              onSaveAsset={handleSaveAsset}
+              onDeleteAsset={handleDeleteAsset}
+              onRefreshAssets={() => token && fetchAssets(token, activeCompany.id)}
+            />
+          )}
 
           {activeTab === 'whiteboard' && activeCompany && (
             <ExcalidrawBoard
@@ -828,7 +989,6 @@ export default function App() {
               isViewer={isViewer}
             />
           )}
-
 
           {activeTab === 'activity' && activeCompany && token && (
             <ActivityHubView

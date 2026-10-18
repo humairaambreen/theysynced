@@ -1,6 +1,6 @@
 import React from 'react';
 import { ActiveTab } from '../types';
-import { LayoutGrid, MessageSquare, PenTool, Table, FileText, Activity, Monitor } from 'lucide-react';
+import { LayoutGrid, MessageSquare, PenTool, Table, FileText, Activity, Monitor, FolderGit2 } from 'lucide-react';
 
 interface SidebarProps {
   activeTab: ActiveTab;
@@ -14,10 +14,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const navItems: { id: ActiveTab; label: string; icon: React.FC<{ className?: string }> }[] = [
     { id: 'overview', label: 'Office Perks', icon: LayoutGrid },
     { id: 'teams', label: 'Teams & Chat', icon: MessageSquare },
+    { id: 'assets', label: 'Shared Assets', icon: FolderGit2 },
     { id: 'rdp', label: 'Remote Desktop', icon: Monitor },
     { id: 'whiteboard', label: 'Excalidraw', icon: PenTool },
     { id: 'spreadsheet', label: 'Spreadsheets', icon: Table },
-    { id: 'docs', label: 'Docs & PDFs', icon: FileText },
+    { id: 'docs', label: 'Docs', icon: FileText },
     { id: 'activity', label: 'Activity Hub', icon: Activity },
   ];
 

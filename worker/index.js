@@ -751,7 +751,7 @@ export default {
           const existingIdx = assets.findIndex(a => a.id === asset.id);
           asset.updated_at = new Date().toISOString();
           if (existingIdx >= 0) {
-            assets[existingIdx] = asset;
+            assets[existingIdx] = { ...assets[existingIdx], ...asset };
           } else {
             assets.push(asset);
           }
@@ -760,6 +760,25 @@ export default {
           await db.prepare('INSERT OR REPLACE INTO ts_assets (company_id, data) VALUES (?, ?)').bind(companyId, enc).run();
 
           return jsonResponse({ success: true, asset });
+        }
+
+        // ── Assets: Delete
+        if ((url.pathname === '/api/assets/delete') && (method === 'POST' || method === 'DELETE')) {
+          const body = await request.json();
+          const companyId = body.company_id || 'comp_theysynced';
+          const assetId = body.id || body.asset_id;
+          if (!assetId) return errorResponse('Missing asset id');
+
+          const row = await db.prepare('SELECT data FROM ts_assets WHERE company_id = ?').bind(companyId).first();
+          if (row) {
+            const assets = JSON.parse(await decryptForOrg(null, row.data, secret));
+            // Remove the asset and any sub-items that had this folder as parent
+            const filtered = assets.filter(a => a.id !== assetId && a.parent_id !== assetId && a.folder_id !== assetId);
+            const enc = await encryptForOrg(companyId, JSON.stringify(filtered), secret);
+            await db.prepare('INSERT OR REPLACE INTO ts_assets (company_id, data) VALUES (?, ?)').bind(companyId, enc).run();
+          }
+
+          return jsonResponse({ success: true, message: 'Asset deleted' });
         }
 
         // ── Chat: Messages List / History (Returns { success: true, messages: [...] })
@@ -780,10 +799,19 @@ export default {
         // ── Chat: Send / Save Message
         if ((url.pathname === '/api/chat/messages/save' || url.pathname === '/api/chat/send') && method === 'POST') {
           const body = await request.json();
-          const { channel_id, message, username, user_id, file_attachment } = body;
+          let { channel_id, message, username, user_id, file_attachment, token } = body;
           const chanKey = channel_id || body.company_id || 'comp_theysynced';
           const match = chanKey.match(/(comp_[a-zA-Z0-9]+)/);
           const compId = body.company_id || (match ? match[1] : chanKey);
+
+          // If username wasn't provided or defaulted to Anonymous, decode from token if available
+          if ((!username || username === 'Anonymous') && token && token.startsWith('ts_jwt_')) {
+            try {
+              const decoded = JSON.parse(atob(token.replace('ts_jwt_', '')));
+              if (decoded.username) username = decoded.username;
+              if (decoded.id && (!user_id || user_id === 'user_anonymous')) user_id = decoded.id;
+            } catch (_) {}
+          }
 
           const row = await db.prepare('SELECT data FROM ts_messages WHERE key = ?').bind(chanKey).first();
           let messages = [];
@@ -808,6 +836,57 @@ export default {
 
           const enc = await encryptForOrg(compId, JSON.stringify(messages), secret);
           await db.prepare('INSERT OR REPLACE INTO ts_messages (key, data) VALUES (?, ?)').bind(chanKey, enc).run();
+
+          // Auto-index file attachment into ts_assets with folder hierarchy and DM privacy restrictions
+          if (file_attachment && file_attachment.url) {
+            try {
+              const assetRow = await db.prepare('SELECT data FROM ts_assets WHERE company_id = ?').bind(compId).first();
+              const companyAssets = assetRow ? JSON.parse(await decryptForOrg(null, assetRow.data, secret)) : [];
+
+              let folderName = 'General';
+              let scope = 'shared';
+              let allowedUsers = null;
+
+              if (chanKey.includes('DM:') || chanKey.includes('dm-')) {
+                scope = 'dm';
+                const matchDm = chanKey.match(/DM:([^-]+)-(.+)/i);
+                if (matchDm) {
+                  allowedUsers = [matchDm[1], matchDm[2]];
+                  folderName = `@${matchDm[1]} & @${matchDm[2]}`;
+                } else {
+                  folderName = 'Direct Messages';
+                }
+              } else if (chanKey.startsWith('team_')) {
+                folderName = chanKey.replace(`team_${compId}_`, '');
+                if (folderName === 'gen') folderName = 'General';
+                else folderName = `#${folderName}`;
+              }
+
+              const newFileAsset = {
+                id: `file_chat_${newMsg.id}`,
+                company_id: compId,
+                team_id: newMsg.team_id,
+                asset_type: 'file',
+                name: file_attachment.name || 'attachment',
+                url: file_attachment.url,
+                file_type: file_attachment.file_type || 'application/octet-stream',
+                size: file_attachment.size || 0,
+                created_by: username || 'Unknown',
+                updated_at: new Date().toISOString(),
+                folder_path: scope === 'dm' ? `/Chat Attachments/Direct Messages/${folderName}` : `/Chat Attachments/${folderName}`,
+                scope: scope,
+                allowed_users: allowedUsers,
+              };
+
+              if (!companyAssets.some(a => a.id === newFileAsset.id || (a.url === newFileAsset.url && a.name === newFileAsset.name))) {
+                companyAssets.push(newFileAsset);
+                const encAssets = await encryptForOrg(compId, JSON.stringify(companyAssets), secret);
+                await db.prepare('INSERT OR REPLACE INTO ts_assets (company_id, data) VALUES (?, ?)').bind(compId, encAssets).run();
+              }
+            } catch (err) {
+              console.warn('[Chat Attachment Indexing Error]', err);
+            }
+          }
 
           return jsonResponse({ success: true, message: newMsg });
         }
@@ -857,13 +936,12 @@ export default {
           return assetResponse;
         }
 
-        // If asset not found, but it is an HTML / browser navigation, serve index.html (SPA routing)
+        // If asset not found, but it is an HTML / browser navigation, serve root index (SPA routing)
         if (request.headers.get('accept')?.includes('text/html') || method === 'GET') {
-          const indexUrl = new URL('/index.html', request.url);
-          const indexRequest = new Request(indexUrl.toString(), request);
-          const indexResponse = await env.ASSETS.fetch(indexRequest);
-          if (indexResponse.status === 200) {
-            return indexResponse;
+          const rootUrl = new URL('/', request.url);
+          const rootResponse = await env.ASSETS.fetch(rootUrl.toString());
+          if (rootResponse.status === 200) {
+            return rootResponse;
           }
         }
       } catch (_) {}
