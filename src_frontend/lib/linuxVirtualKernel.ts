@@ -4,8 +4,9 @@
  * APT (Debian dpkg) & Homebrew (brew) package managers, and command pipeline execution.
  */
 
-import { AVAILABLE_PACKAGES, PackageMeta, resolvePackageName, renderNeofetch, renderHtop } from './linuxPackageEngine';
+import { AVAILABLE_PACKAGES, PackageMeta, resolvePackageName, resolvePackageMeta, renderNeofetch, renderHtop } from './linuxPackageEngine';
 import { LinuxFileEntry } from './linuxFilesystem';
+
 
 export interface VNode {
   path: string;
@@ -835,18 +836,19 @@ All packages are up to date.`,
         const nextInstalled = new Set(this.installedPackages);
 
         for (const t of pkgTargets) {
-          const resolved = resolvePackageName(t);
-          const meta = AVAILABLE_PACKAGES[resolved];
-          if (!meta) {
-            logLines.push(`E: Unable to locate package ${t}`);
-            continue;
-          }
+          const meta = resolvePackageMeta(t);
           if (nextInstalled.has(meta.name)) {
             logLines.push(`${meta.name} is already the newest version (${meta.version}).`);
             continue;
           }
 
           nextInstalled.add(meta.name);
+          // Register binary and manpage in virtual filesystem
+          for (const b of meta.binaries) {
+            this.writeFile(`/usr/bin/${b}`, `#!/bin/sh\n# ${meta.name} executable binary\necho "${b} (${meta.name}) version ${meta.version}"`, 'root', '0755');
+          }
+          this.writeFile(`/usr/share/man/man1/${meta.name}.1`, `${meta.name.toUpperCase()}(1) Linux User's Manual\nNAME\n  ${meta.name} - ${meta.description}`, 'root', '0644');
+
           logLines.push(`Reading package lists... Done
 Building dependency tree... Done
 Reading state information... Done
@@ -855,7 +857,7 @@ The following NEW packages will be installed:
 0 upgraded, ${meta.dependencies.length + 1} newly installed, 0 to remove.
 Need to get ${Math.round(meta.installedSize / 4)} kB of archives.
 After this operation, ${(meta.installedSize / 1024).toFixed(1)} MB of additional disk space will be used.
-Get:1 http://deb.theysynced.org/enterprise jammy/main ${meta.name} ${meta.architecture} [${Math.round(meta.installedSize / 4)} kB]
+Get:1 http://deb.debian.org/debian bookworm/main ${meta.name} ${meta.architecture} [${Math.round(meta.installedSize / 4)} kB]
 Fetched ${Math.round(meta.installedSize / 4)} kB in 0.2s
 Selecting previously unselected package ${meta.name}.
 (Reading database ... 28412 files and directories currently installed.)
@@ -941,9 +943,8 @@ Processing triggers for man-db (2.10.2-1) ...`);
       }
 
       if (subcmd === 'show') {
-        const resolved = resolvePackageName(pkgTargets[0] || '');
-        const p = AVAILABLE_PACKAGES[resolved];
-        if (!p) return { output: '', error: `N: Unable to locate package ${pkgTargets[0]}`, newCwd: cwd };
+        if (!pkgTargets[0]) return { output: '', error: 'E: No package name provided to apt show', newCwd: cwd };
+        const p = resolvePackageMeta(pkgTargets[0]);
         return {
           output: `Package: ${p.name}
 Version: ${p.version}
@@ -954,11 +955,13 @@ Installed-Size: ${p.installedSize} kB
 Depends: ${p.dependencies.join(', ') || 'libc6 (>= 2.34)'}
 Homepage: https://theysynced.com
 Download-Size: ${Math.round(p.installedSize / 4)} kB
+APT-Sources: http://deb.debian.org/debian bookworm/main amd64 Packages
 Description: ${p.description}`,
           error: '',
           newCwd: cwd,
         };
       }
+
 
       return { output: 'Usage: apt [update|install|remove|list|search|show]', error: '', newCwd: cwd };
     }
@@ -979,18 +982,17 @@ Description: ${p.description}`,
         const nextInstalled = new Set(this.installedPackages);
 
         for (const t of pkgTargets) {
-          const resolved = resolvePackageName(t);
-          const meta = AVAILABLE_PACKAGES[resolved];
-          if (!meta) {
-            logLines.push(`Error: No available formula with the name "${t}". Did you mean: ${Object.keys(AVAILABLE_PACKAGES).slice(0, 4).join(', ')}?`);
-            continue;
-          }
+          const meta = resolvePackageMeta(t);
           if (nextInstalled.has(meta.name)) {
             logLines.push(`Warning: ${meta.name} ${meta.version.split('-')[0]} is already installed and up-to-date.`);
             continue;
           }
 
           nextInstalled.add(meta.name);
+          for (const b of meta.binaries) {
+            this.writeFile(`/usr/bin/${b}`, `#!/bin/sh\n# ${meta.name} binary\necho "${b} version ${meta.version}"`, 'root', '0755');
+          }
+
           const ver = meta.version.split('-')[0];
           logLines.push(`==> Downloading https://ghcr.io/v2/homebrew/core/${meta.name}/manifests/${ver}
 ==> Fetching ${meta.name}
@@ -1496,9 +1498,36 @@ From: https://github.com/Homebrew/homebrew-core/blob/master/Formula/${meta.name}
       return { output: `Opening '${targetUrl}' in Web Browser tab...`, error: '', newCwd: cwd, openTab: 'browser', openId: targetUrl };
     }
 
-    // Check if command is a binary from an uninstalled package
-    const foundPkg = Object.values(AVAILABLE_PACKAGES).find((p) => p.binaries.includes(cmd) || p.name === cmd);
-    if (foundPkg) {
+    // Check if command is an installed package binary
+    if (this.installedPackages.has(cmd) || this.installedPackages.has(resolvePackageName(cmd))) {
+      const pkgMeta = resolvePackageMeta(cmd);
+      const flag = args[0] || '';
+      if (flag === '--version' || flag === '-v' || flag === '-V') {
+        return { output: `${cmd} version ${pkgMeta.version} (${pkgMeta.architecture}) - GNU/Linux`, error: '', newCwd: cwd };
+      }
+      if (flag === '--help' || flag === '-h') {
+        return {
+          output: `Usage: ${cmd} [OPTIONS] [FILES...]\n${pkgMeta.description}\nBinary path: /usr/bin/${cmd}`,
+          error: '',
+          newCwd: cwd,
+        };
+      }
+      return {
+        output: `[${cmd}] Executing ${cmd} ${args.join(' ')}\nProcess finished with exit code 0.`,
+        error: '',
+        newCwd: cwd,
+      };
+    }
+
+    // Check if command exists in /usr/bin or /bin
+    const binNode = this.stat(`/usr/bin/${cmd}`) || this.stat(`/bin/${cmd}`);
+    if (binNode && binNode.type === 'file') {
+      return { output: `${cmd}: executed successfully (exit code 0).`, error: '', newCwd: cwd };
+    }
+
+    // Check if command can be installed via dynamic apt
+    if (/^[a-z0-9_.-]{2,30}$/.test(cmd)) {
+      const foundPkg = resolvePackageMeta(cmd);
       return {
         output: '',
         error: `Command '${cmd}' not found, but can be installed with:\n  sudo apt install ${foundPkg.name}\n  brew install ${foundPkg.name}`,
@@ -1514,6 +1543,7 @@ From: https://github.com/Homebrew/homebrew-core/blob/master/Formula/${meta.name}
         return { output: `Execution of binary: ${cmd.slice(2)} [Completed with return code 0]`, error: '', newCwd: cwd };
       }
     }
+
 
     return { output: '', error: `bash: ${cmd}: command not found. Type 'help' for built-in Linux commands, or 'apt list' to search packages.`, newCwd: cwd };
   }

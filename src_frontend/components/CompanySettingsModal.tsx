@@ -14,7 +14,9 @@ import {
   ShieldCheck,
   Database,
   RefreshCw,
-  AlertTriangle
+  AlertTriangle,
+  Users,
+  LogOut,
 } from 'lucide-react';
 
 interface CompanySettingsModalProps {
@@ -23,7 +25,8 @@ interface CompanySettingsModalProps {
   token: string;
   onClose: () => void;
   onCompanyUpdated: (updatedCompany: Company) => void;
-  onCompanyDeleted: () => void;
+  onCompanyDeleted: (deletedCompanyId?: string) => void;
+  onCompanyLeft?: (companyId: string) => void;
 }
 
 export const CompanySettingsModal: React.FC<CompanySettingsModalProps> = ({
@@ -33,8 +36,9 @@ export const CompanySettingsModal: React.FC<CompanySettingsModalProps> = ({
   onClose,
   onCompanyUpdated,
   onCompanyDeleted,
+  onCompanyLeft,
 }) => {
-  const [activeTab, setActiveTab] = useState<'general' | 'governance' | 'danger'>('general');
+  const [activeTab, setActiveTab] = useState<'general' | 'governance' | 'members' | 'danger' | 'leave'>('general');
   const [name, setName] = useState(company.name);
   const [logoUrl, setLogoUrl] = useState(company.logo_url || '');
   const [loading, setLoading] = useState(false);
@@ -45,6 +49,8 @@ export const CompanySettingsModal: React.FC<CompanySettingsModalProps> = ({
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [deleteConfirmName, setDeleteConfirmName] = useState('');
+  const [showLeaveConfirm, setShowLeaveConfirm] = useState(false);
+
 
   const isOwner = company.owner_id === user.id;
   const userMember = (company.members || []).find((m) => m.user_id === user.id);
@@ -193,6 +199,34 @@ export const CompanySettingsModal: React.FC<CompanySettingsModalProps> = ({
     }
   };
 
+  const handleLeaveCompany = async () => {
+    setLoading(true);
+    setErrorMsg(null);
+
+    try {
+      const res = await fetch('/api/companies/leave', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token, company_id: company.id }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        if (onCompanyLeft) {
+          onCompanyLeft(company.id);
+        } else {
+          onCompanyDeleted(company.id);
+        }
+        onClose();
+      } else {
+        setErrorMsg(data.message || data.error || 'Failed to leave company');
+      }
+    } catch (err: any) {
+      setErrorMsg(err.message || 'Network error');
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleDeleteCompany = async () => {
     if (deleteConfirmName.trim() !== company.name.trim()) {
       setErrorMsg(`Please type "${company.name}" exactly to confirm permanent deletion.`);
@@ -210,7 +244,7 @@ export const CompanySettingsModal: React.FC<CompanySettingsModalProps> = ({
       });
       const data = await res.json();
       if (data.success) {
-        onCompanyDeleted();
+        onCompanyDeleted(company.id);
         onClose();
       } else {
         setErrorMsg(data.message || 'Failed to delete company');
@@ -259,7 +293,17 @@ export const CompanySettingsModal: React.FC<CompanySettingsModalProps> = ({
             <span>Data & Encryption</span>
           </button>
 
-          {isOwner && (
+          <button
+            onClick={() => setActiveTab('members')}
+            className={`w-full text-left px-4 py-2.5 rounded-2xl text-xs font-semibold flex items-center gap-2.5 transition-all ${
+              activeTab === 'members' ? 'bg-slate-900 text-white shadow-sm' : 'text-slate-600 hover:bg-slate-50'
+            }`}
+          >
+            <Users className="w-4 h-4 text-indigo-500" />
+            <span>Members & Roles</span>
+          </button>
+
+          {isOwner ? (
             <button
               onClick={() => setActiveTab('danger')}
               className={`w-full text-left px-4 py-2.5 rounded-2xl text-xs font-semibold flex items-center gap-2.5 transition-all mt-auto ${
@@ -267,10 +311,21 @@ export const CompanySettingsModal: React.FC<CompanySettingsModalProps> = ({
               }`}
             >
               <Trash2 className="w-4 h-4" />
-              <span>Danger Zone</span>
+              <span>Danger Zone (Delete)</span>
+            </button>
+          ) : (
+            <button
+              onClick={() => setActiveTab('leave')}
+              className={`w-full text-left px-4 py-2.5 rounded-2xl text-xs font-semibold flex items-center gap-2.5 transition-all mt-auto ${
+                activeTab === 'leave' ? 'bg-amber-600 text-white shadow-sm' : 'text-amber-700 hover:bg-amber-50'
+              }`}
+            >
+              <LogOut className="w-4 h-4" />
+              <span>Leave Company</span>
             </button>
           )}
         </div>
+
 
         {/* Content Body */}
         <div className="flex-1 p-6 md:p-8 overflow-y-auto">
@@ -477,6 +532,103 @@ export const CompanySettingsModal: React.FC<CompanySettingsModalProps> = ({
               )}
             </div>
           )}
+
+          {activeTab === 'members' && (
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h3 className="text-sm font-bold text-slate-900">Organization Members</h3>
+                  <p className="text-xs text-slate-500">Users with access to this encrypted workspace</p>
+                </div>
+                <span className="px-2.5 py-1 bg-slate-100 text-slate-700 text-xs font-bold rounded-full">
+                  {(company.members || []).length} Members
+                </span>
+              </div>
+
+              <div className="divide-y divide-slate-100 border border-slate-200 rounded-2xl overflow-hidden bg-white">
+                {(company.members && company.members.length > 0 ? company.members : [
+                  { user_id: company.owner_id, username: 'Owner', role: 'Owner', joined_at: company.created_at }
+                ]).map((m: any, idx: number) => {
+                  const isCurrent = m.user_id === user.id;
+                  const isMemberOwner = m.user_id === company.owner_id || m.role === 'Owner';
+                  return (
+                    <div key={idx} className="p-3.5 flex items-center justify-between hover:bg-slate-50 transition-colors">
+                      <div className="flex items-center space-x-3">
+                        <div className="w-8 h-8 rounded-full bg-indigo-100 text-indigo-700 font-bold flex items-center justify-center text-xs">
+                          {(m.username || 'U').charAt(0).toUpperCase()}
+                        </div>
+                        <div>
+                          <div className="text-xs font-bold text-slate-900 flex items-center gap-1.5">
+                            <span>{m.username || 'Member'}</span>
+                            {isCurrent && (
+                              <span className="text-[10px] text-indigo-600 bg-indigo-50 px-1.5 py-0.5 rounded font-semibold">
+                                You
+                              </span>
+                            )}
+                          </div>
+                          <div className="text-[10px] text-slate-400">
+                            Joined {m.joined_at ? new Date(m.joined_at).toLocaleDateString() : 'recently'}
+                          </div>
+                        </div>
+                      </div>
+                      <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold ${
+                        isMemberOwner ? 'bg-purple-100 text-purple-700' : 'bg-slate-100 text-slate-600'
+                      }`}>
+                        {m.role || (isMemberOwner ? 'Owner' : 'Member')}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {activeTab === 'leave' && !isOwner && (
+            <div className="space-y-4">
+              <div className="flex items-center gap-2 text-amber-700">
+                <LogOut className="w-5 h-5" />
+                <h3 className="text-sm font-bold">Leave Organization</h3>
+              </div>
+              <p className="text-xs text-slate-500 leading-relaxed">
+                Leaving <strong>{company.name}</strong> will revoke your access to all teams, encrypted chat channels,
+                whiteboards, spreadsheets, documents, and Jira tasks in this workspace. You will need a new invite code to re-join.
+              </p>
+
+              {!showLeaveConfirm ? (
+                <button
+                  onClick={() => setShowLeaveConfirm(true)}
+                  className="px-6 py-3 bg-amber-600 text-white rounded-full text-xs font-bold hover:bg-amber-700 transition-all shadow-sm"
+                >
+                  Leave this Company Workspace
+                </button>
+              ) : (
+                <div className="p-5 bg-amber-50 border border-amber-200 rounded-2xl space-y-3">
+                  <div className="text-xs font-bold text-amber-900">
+                    Are you sure you want to leave <strong>{company.name}</strong>?
+                  </div>
+                  <p className="text-xs text-amber-700">
+                    Your personal user account will remain active, but you will be detached from this organization.
+                  </p>
+                  <div className="flex items-center gap-2 pt-1">
+                    <button
+                      onClick={handleLeaveCompany}
+                      disabled={loading}
+                      className="px-5 py-2.5 bg-amber-600 text-white rounded-full text-xs font-bold hover:bg-amber-700 transition-all disabled:opacity-40"
+                    >
+                      {loading ? 'Leaving Workspace…' : 'Yes, Confirm Leave Company'}
+                    </button>
+                    <button
+                      onClick={() => setShowLeaveConfirm(false)}
+                      className="px-5 py-2.5 bg-slate-200 text-slate-700 rounded-full text-xs font-semibold hover:bg-slate-300 transition-all"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
         </div>
       </div>
     </div>

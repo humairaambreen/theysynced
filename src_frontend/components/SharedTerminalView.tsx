@@ -93,11 +93,35 @@ export const SharedTerminalView: React.FC<SharedTerminalViewProps> = ({
   const [nanoContent, setNanoContent] = useState<string>('');
   const [nanoModified, setNanoModified] = useState<boolean>(false);
 
+  const [terminalMode, setTerminalMode] = useState<'debian' | 'workspace' | 'split'>('debian');
+  const [debianKey, setDebianKey] = useState<number>(0);
+  const [copiedBridge, setCopiedBridge] = useState<boolean>(false);
+
+  const handleCopyWorkspaceBridgeCommand = () => {
+    const bridgeScript = `# TheySynced Enterprise Workspace Bridge
+mkdir -p ~/theysynced && cd ~/theysynced
+cat << 'EOF' > README.txt
+Organization: ${company.name} (${company.id})
+Synced: ${new Date().toISOString()}
+This terminal has full Debian Bookworm x86 root privileges with real apt-get!
+Try:
+  apt-get update
+  apt-get install -y python3-pip htop git curl build-essential
+EOF
+echo "✅ Workspace synced into ~/theysynced!"
+cat README.txt
+`;
+    navigator.clipboard.writeText(bridgeScript.trim());
+    setCopiedBridge(true);
+    setTimeout(() => setCopiedBridge(false), 2500);
+  };
+
   const pyodideRef = useRef<any>(null);
   const kernelRef = useRef<LinuxVirtualKernel | null>(null);
   const terminalEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const nanoTextareaRef = useRef<HTMLTextAreaElement>(null);
+
 
   // Build unified Linux filesystem entries from company state
   const { entries: linuxEntries } = useMemo(() => {
@@ -743,62 +767,10 @@ Unified Operating System Commands:
     });
   };
 
-  return (
-    <div className="flex-1 flex flex-col h-full bg-[#0d1117] text-slate-100 font-mono text-xs select-text overflow-hidden">
-      
-      {/* Terminal Title Bar */}
-      <div className="bg-[#161b22] border-b border-white/10 px-4 py-2 flex items-center justify-between shrink-0 select-none">
-        <div className="flex items-center space-x-3">
-          <div className="flex items-center space-x-1.5">
-            <div className="w-3 h-3 rounded-full bg-rose-500/80 cursor-pointer" onClick={() => setLogs([])} title="Clear terminal" />
-            <div className="w-3 h-3 rounded-full bg-amber-500/80" />
-            <div className="w-3 h-3 rounded-full bg-emerald-500/80" />
-          </div>
-
-          <div className="flex items-center space-x-2 text-slate-300 font-semibold text-xs">
-            <TerminalIcon className="w-4 h-4 text-emerald-400" />
-            <span>GNU/Linux Virtual Terminal</span>
-            <span className="text-[10px] text-slate-400 bg-slate-800 px-2 py-0.5 rounded-full border border-slate-700">
-              {isRoot ? 'root@' : `${user.username}@`}{hostname}
-            </span>
-            {isRoot && (
-              <span className="text-[10px] font-bold text-rose-300 bg-rose-950/80 px-2 py-0.5 rounded-full border border-rose-800 flex items-center space-x-1">
-                <ShieldAlert className="w-3 h-3 text-rose-400" />
-                <span>ROOT PRIVILEGES</span>
-              </span>
-            )}
-          </div>
-        </div>
-
-        <div className="flex items-center space-x-2 text-[11px] text-slate-400">
-          <span className="hidden sm:inline bg-slate-800/80 px-2 py-0.5 rounded border border-slate-700">
-            APT & Brew: <strong className="text-emerald-400 font-mono">{installedPackages.length} pkgs</strong>
-          </span>
-
-          {onNavigateTab && (
-            <button
-              onClick={() => onNavigateTab('assets', cwd)}
-              className="flex items-center space-x-1 px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg transition"
-              title="Open current directory in Nautilus GUI"
-            >
-              <FolderGit2 className="w-3.5 h-3.5 text-indigo-400" />
-              <span>Nautilus GUI</span>
-            </button>
-          )}
-
-          <button
-            onClick={() => setLogs([])}
-            className="p-1 hover:text-white rounded hover:bg-slate-800 transition"
-            title="Clear Terminal Output"
-          >
-            <Trash2 className="w-3.5 h-3.5" />
-          </button>
-        </div>
-      </div>
-
-      {/* Main Terminal Viewport */}
-      {nanoActive ? (
-        /* Nano Text Editor Screen */
+  // Render POSIX Workspace Virtual Shell
+  const renderWorkspaceShell = () => {
+    if (nanoActive) {
+      return (
         <div className="flex-1 flex flex-col bg-[#05080f] select-text">
           <div className="bg-slate-800 text-slate-200 px-4 py-1 flex items-center justify-between text-[11px] font-mono border-b border-white/10">
             <span>GNU nano 7.2 &bull; File: <strong>{nanoFileName}</strong> {nanoModified && <span className="text-amber-400 font-bold">[Modified]</span>}</span>
@@ -842,81 +814,216 @@ Unified Operating System Commands:
             <div><span className="bg-white/20 text-white px-1 rounded mr-1">^U</span> Paste text</div>
           </div>
         </div>
-      ) : (
-        /* Standard Linux Shell Screen */
-        <div 
-          onClick={handleContainerClick}
-          className="flex-1 p-4 overflow-y-auto space-y-2 select-text cursor-text"
-        >
-          {logs.map((log) => {
-            if (log.type === 'command') {
-              return (
-                <div key={log.id} className="text-emerald-400 font-semibold break-words">
-                  {log.text}
-                </div>
-              );
-            }
-            if (log.type === 'system') {
-              return (
-                <div key={log.id} className="text-slate-400 italic whitespace-pre-wrap leading-relaxed py-0.5 border-l-2 border-indigo-500/50 pl-2 my-1">
-                  {log.text}
-                </div>
-              );
-            }
-            if (log.type === 'error') {
-              return (
-                <div key={log.id} className="text-rose-400 whitespace-pre-wrap leading-relaxed">
-                  {log.text}
-                </div>
-              );
-            }
+      );
+    }
+
+    return (
+      <div 
+        onClick={handleContainerClick}
+        className="flex-1 p-4 overflow-y-auto space-y-2 select-text cursor-text bg-[#0d1117]"
+      >
+        {logs.map((log) => {
+          if (log.type === 'command') {
             return (
-              <div key={log.id} className="text-slate-200 whitespace-pre-wrap leading-relaxed">
+              <div key={log.id} className="text-emerald-400 font-semibold break-words">
                 {log.text}
               </div>
             );
-          })}
+          }
+          if (log.type === 'system') {
+            return (
+              <div key={log.id} className="text-slate-400 italic whitespace-pre-wrap leading-relaxed py-0.5 border-l-2 border-indigo-500/50 pl-2 my-1">
+                {log.text}
+              </div>
+            );
+          }
+          if (log.type === 'error') {
+            return (
+              <div key={log.id} className="text-rose-400 whitespace-pre-wrap leading-relaxed">
+                {log.text}
+              </div>
+            );
+          }
+          return (
+            <div key={log.id} className="text-slate-200 whitespace-pre-wrap leading-relaxed">
+              {log.text}
+            </div>
+          );
+        })}
 
-          <div className="flex items-center space-x-2 pt-1">
-            {isPythonRepl ? (
-              <span className="text-amber-400 font-bold shrink-0">&gt;&gt;&gt;&nbsp;</span>
-            ) : isNodeRepl ? (
-              <span className="text-emerald-400 font-bold shrink-0">&gt;&nbsp;</span>
-            ) : isRoot ? (
-              <span className="shrink-0 flex items-center space-x-1">
-                <span className="text-rose-500 font-bold">root</span>
-                <span className="text-slate-400">@</span>
-                <span className="text-cyan-400 font-bold">{hostname}</span>
-                <span className="text-slate-400">:</span>
-                <span className="text-blue-400 font-bold">{cwd}</span>
-                <span className="text-rose-500 font-bold">#</span>
-              </span>
-            ) : (
-              <span className="shrink-0 flex items-center space-x-1">
-                <span className="text-emerald-400 font-bold">{user.username}</span>
-                <span className="text-slate-400">@</span>
-                <span className="text-cyan-400 font-bold">{hostname}</span>
-                <span className="text-slate-400">:</span>
-                <span className="text-blue-400 font-bold">{cwd}</span>
-                <span className="text-amber-400 font-bold">$</span>
-              </span>
-            )}
-            <input
-              ref={inputRef}
-              type="text"
-              value={inputVal}
-              onChange={(e) => setInputVal(e.target.value)}
-              onKeyDown={handleKeyDown}
-              className="flex-1 bg-transparent text-white font-mono text-xs outline-none caret-emerald-400"
-              autoFocus
-              spellCheck={false}
-              autoComplete="off"
-            />
+        <div className="flex items-center space-x-2 pt-1">
+          {isPythonRepl ? (
+            <span className="text-amber-400 font-bold shrink-0">&gt;&gt;&gt;&nbsp;</span>
+          ) : isNodeRepl ? (
+            <span className="text-emerald-400 font-bold shrink-0">&gt;&nbsp;</span>
+          ) : isRoot ? (
+            <span className="shrink-0 flex items-center space-x-1">
+              <span className="text-rose-500 font-bold">root</span>
+              <span className="text-slate-400">@</span>
+              <span className="text-cyan-400 font-bold">{hostname}</span>
+              <span className="text-slate-400">:</span>
+              <span className="text-blue-400 font-bold">{cwd}</span>
+              <span className="text-rose-500 font-bold">#</span>
+            </span>
+          ) : (
+            <span className="shrink-0 flex items-center space-x-1">
+              <span className="text-emerald-400 font-bold">{user.username}</span>
+              <span className="text-slate-400">@</span>
+              <span className="text-cyan-400 font-bold">{hostname}</span>
+              <span className="text-slate-400">:</span>
+              <span className="text-blue-400 font-bold">{cwd}</span>
+              <span className="text-amber-400 font-bold">$</span>
+            </span>
+          )}
+          <input
+            ref={inputRef}
+            type="text"
+            value={inputVal}
+            onChange={(e) => setInputVal(e.target.value)}
+            onKeyDown={handleKeyDown}
+            className="flex-1 bg-transparent text-white font-mono text-xs outline-none caret-emerald-400"
+            autoFocus
+            spellCheck={false}
+            autoComplete="off"
+          />
+        </div>
+
+        <div ref={terminalEndRef} />
+      </div>
+    );
+  };
+
+  // Render Real Debian WebVM CheerpX Frame
+  const renderDebianVM = (isHalfWidth = false) => {
+    return (
+      <div className={`flex flex-col bg-black overflow-hidden ${isHalfWidth ? 'flex-1 md:w-1/2 border-r border-white/10' : 'flex-1'}`}>
+        <div className="bg-[#12161f] text-slate-300 px-3 py-1.5 flex items-center justify-between text-[11px] border-b border-white/10 shrink-0">
+          <div className="flex items-center space-x-2">
+            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+            <span className="font-bold text-white">Debian 12 Bookworm (x86_64)</span>
+            <span className="text-slate-400 hidden sm:inline">&bull; Real apt-get & dpkg &bull; WebVM x86</span>
+          </div>
+          <div className="flex items-center space-x-2">
+            <button
+              onClick={handleCopyWorkspaceBridgeCommand}
+              className="px-2 py-0.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-[10px] font-bold flex items-center space-x-1 transition"
+              title="Copy shell script to sync company files into Debian VM"
+            >
+              <Download className="w-3 h-3" />
+              <span>{copiedBridge ? 'Script Copied!' : 'Bridge Files'}</span>
+            </button>
+            <button
+              onClick={() => setDebianKey((prev) => prev + 1)}
+              className="px-2 py-0.5 bg-slate-700 hover:bg-slate-600 text-slate-200 rounded text-[10px] font-semibold transition"
+              title="Reboot virtual machine"
+            >
+              Reboot VM
+            </button>
+          </div>
+        </div>
+        <iframe
+          key={debianKey}
+          src="https://webvm.io"
+          className="w-full flex-1 border-0 bg-black"
+          allow="clipboard-read; clipboard-write; fullscreen; cross-origin-isolated"
+          title="Real Debian Linux Terminal (WebVM)"
+        />
+      </div>
+    );
+  };
+
+  return (
+    <div className="flex-1 flex flex-col h-full bg-[#0d1117] text-slate-100 font-mono text-xs select-text overflow-hidden">
+      
+      {/* Terminal Mode Switcher & Title Bar */}
+      <div className="bg-[#161b22] border-b border-white/10 px-4 py-2 flex items-center justify-between shrink-0 select-none">
+        <div className="flex items-center space-x-3">
+          <div className="flex items-center space-x-1.5">
+            <div className="w-3 h-3 rounded-full bg-rose-500/80 cursor-pointer" onClick={() => setLogs([])} title="Clear terminal" />
+            <div className="w-3 h-3 rounded-full bg-amber-500/80" />
+            <div className="w-3 h-3 rounded-full bg-emerald-500/80" />
           </div>
 
-          <div ref={terminalEndRef} />
+          <div className="flex items-center space-x-2">
+            <button
+              onClick={() => setTerminalMode('debian')}
+              className={`px-3 py-1 rounded-full text-xs font-bold flex items-center space-x-1.5 transition-all ${
+                terminalMode === 'debian'
+                  ? 'bg-indigo-600 text-white shadow-sm'
+                  : 'bg-slate-800 text-slate-400 hover:text-slate-200 hover:bg-slate-700'
+              }`}
+            >
+              <span>🐧 Debian 12 (Real APT)</span>
+            </button>
+
+            <button
+              onClick={() => setTerminalMode('workspace')}
+              className={`px-3 py-1 rounded-full text-xs font-bold flex items-center space-x-1.5 transition-all ${
+                terminalMode === 'workspace'
+                  ? 'bg-emerald-600 text-white shadow-sm'
+                  : 'bg-slate-800 text-slate-400 hover:text-slate-200 hover:bg-slate-700'
+              }`}
+            >
+              <span>📁 Workspace POSIX Shell</span>
+            </button>
+
+            <button
+              onClick={() => setTerminalMode('split')}
+              className={`hidden md:flex px-3 py-1 rounded-full text-xs font-bold items-center space-x-1.5 transition-all ${
+                terminalMode === 'split'
+                  ? 'bg-purple-600 text-white shadow-sm'
+                  : 'bg-slate-800 text-slate-400 hover:text-slate-200 hover:bg-slate-700'
+              }`}
+            >
+              <span>🔀 Split Screen</span>
+            </button>
+          </div>
         </div>
+
+        <div className="flex items-center space-x-2 text-[11px] text-slate-400">
+          <span className="hidden sm:inline bg-slate-800/80 px-2 py-0.5 rounded border border-slate-700">
+            {terminalMode === 'debian' ? 'x86_64 Debian GNU/Linux' : `APT & Brew: ${installedPackages.length} pkgs`}
+          </span>
+
+          {onNavigateTab && (
+            <button
+              onClick={() => onNavigateTab('assets', cwd)}
+              className="flex items-center space-x-1 px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg transition"
+              title="Open current directory in Nautilus GUI"
+            >
+              <FolderGit2 className="w-3.5 h-3.5 text-indigo-400" />
+              <span>Nautilus GUI</span>
+            </button>
+          )}
+
+          <button
+            onClick={() => setLogs([])}
+            className="p-1 hover:text-white rounded hover:bg-slate-800 transition"
+            title="Clear Terminal Output"
+          >
+            <Trash2 className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      </div>
+
+      {/* Main Terminal Viewport */}
+      {terminalMode === 'debian' ? (
+        renderDebianVM(false)
+      ) : terminalMode === 'split' ? (
+        <div className="flex-1 flex flex-col md:flex-row overflow-hidden">
+          {renderDebianVM(true)}
+          <div className="flex-1 flex flex-col overflow-hidden">
+            <div className="bg-[#12161f] text-slate-300 px-3 py-1.5 flex items-center justify-between text-[11px] border-b border-white/10 shrink-0">
+              <span className="font-bold text-white">📁 Workspace Shell: {cwd}</span>
+              <span className="text-[10px] text-slate-400">Encrypted AES-256 Storage</span>
+            </div>
+            {renderWorkspaceShell()}
+          </div>
+        </div>
+      ) : (
+        renderWorkspaceShell()
       )}
+
 
       {/* Terminal Footer Info Bar */}
       <div className="h-7 bg-[#161b22] border-t border-white/10 px-4 flex items-center justify-between text-[11px] text-slate-400 font-sans shrink-0">

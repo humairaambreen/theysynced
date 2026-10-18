@@ -439,9 +439,15 @@ export default function App() {
       const data = await res.json();
       if (data.success && data.companies && data.companies.length > 0) {
         setCompanies(data.companies);
-        setActiveCompany(data.companies[0]);
-        fetchTeams(authToken, data.companies[0].id);
-        fetchAssets(authToken, data.companies[0].id);
+        const storedCompId = typeof window !== 'undefined' ? localStorage.getItem('theysynced_active_company_id') : null;
+        const matched = data.companies.find((c: Company) => c.id === storedCompId);
+        const selected = matched || data.companies[0];
+        setActiveCompany(selected);
+        if (typeof window !== 'undefined') {
+          localStorage.setItem('theysynced_active_company_id', selected.id);
+        }
+        fetchTeams(authToken, selected.id);
+        fetchAssets(authToken, selected.id);
       } else {
         setCompanies([]);
         setActiveCompany(null);
@@ -453,6 +459,7 @@ export default function App() {
       setIsLoadingCompanies(false);
     }
   };
+
 
 
   const fetchTeams = async (authToken: string, companyId: string) => {
@@ -585,6 +592,10 @@ export default function App() {
 
   const handleSelectCompany = (comp: Company) => {
     setActiveCompany(comp);
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('theysynced_active_company_id', comp.id);
+    }
+    setChatMessages([]);
     if (token) {
       fetchTeams(token, comp.id);
       fetchAssets(token, comp.id);
@@ -592,13 +603,75 @@ export default function App() {
   };
 
   const handleCompanyCreatedOrJoined = (comp: Company) => {
-    setCompanies((prev) => [...prev.filter((c) => c.id !== comp.id), comp]);
+    setCompanies((prev) => {
+      const exists = prev.some((c) => c.id === comp.id);
+      if (exists) {
+        return prev.map((c) => (c.id === comp.id ? comp : c));
+      }
+      return [...prev, comp];
+    });
     setActiveCompany(comp);
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('theysynced_active_company_id', comp.id);
+    }
+    setChatMessages([]);
     if (token) {
       fetchTeams(token, comp.id);
       fetchAssets(token, comp.id);
     }
   };
+
+  const handleCompanyDeleted = (deletedCompanyId?: string) => {
+    const targetId = deletedCompanyId || activeCompany?.id;
+    const remaining = companies.filter((c) => c.id !== targetId);
+    setCompanies(remaining);
+    const nextCompany = remaining[0] || null;
+    setActiveCompany(nextCompany);
+    if (nextCompany) {
+      if (typeof window !== 'undefined') {
+        localStorage.setItem('theysynced_active_company_id', nextCompany.id);
+      }
+      setChatMessages([]);
+      if (token) {
+        fetchTeams(token, nextCompany.id);
+        fetchAssets(token, nextCompany.id);
+      }
+    } else {
+      if (typeof window !== 'undefined') {
+        localStorage.removeItem('theysynced_active_company_id');
+      }
+      setTeams([]);
+      setAssets([]);
+      setChatMessages([]);
+    }
+    setShowCompanySettings(false);
+  };
+
+  const handleLeaveCompany = async (targetCompany?: Company) => {
+    const compToLeave = targetCompany || activeCompany;
+    if (!compToLeave || !token) return;
+
+    if (!window.confirm(`Are you sure you want to leave ${compToLeave.name}?`)) {
+      return;
+    }
+
+    try {
+      const res = await fetch('/api/companies/leave', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token, company_id: compToLeave.id }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        handleCompanyDeleted(compToLeave.id);
+      } else {
+        alert(data.message || data.error || 'Failed to leave company');
+      }
+    } catch (err: any) {
+      alert(err.message || 'Network error');
+    }
+  };
+
 
 
   const handleSendMessage = async (text: string, teamId?: string, attachment?: any) => {
@@ -937,8 +1010,11 @@ export default function App() {
         onOpenUserSettings={() => setShowUserSettings(true)}
         onOpenCommandPalette={() => setShowCommandPalette(true)}
         onOpenInvite={() => setShowInviteModal(true)}
+        onLeaveCompany={handleLeaveCompany}
+        onDeleteCompany={() => setShowCompanySettings(true)}
         onLogout={handleLogout}
       />
+
 
 
 
@@ -1123,11 +1199,10 @@ export default function App() {
             setActiveCompany(updatedCompany);
             setCompanies((prev) => prev.map((c) => (c.id === updatedCompany.id ? updatedCompany : c)));
           }}
-          onCompanyDeleted={() => {
-            setShowCompanySettings(false);
-            if (token) fetchUserCompanies(token);
-          }}
+          onCompanyDeleted={handleCompanyDeleted}
+          onCompanyLeft={handleCompanyDeleted}
         />
+
       )}
 
       {/* User Profile & Passkey Settings Modal */}

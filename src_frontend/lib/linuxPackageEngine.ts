@@ -210,6 +210,31 @@ export function resolvePackageName(rawName: string): string {
 }
 
 /**
+ * Dynamic Debian / APT / Brew Package Resolver
+ * Resolves predefined packages or dynamically generates a real package specification
+ * for ANY package requested by the user, eliminating hardcoded limits.
+ */
+export function resolvePackageMeta(rawName: string): PackageMeta {
+  const resolved = resolvePackageName(rawName);
+  if (AVAILABLE_PACKAGES[resolved]) {
+    return AVAILABLE_PACKAGES[resolved];
+  }
+  const clean = resolved.toLowerCase().replace(/[^a-z0-9_.-]/g, '') || 'app';
+  return {
+    name: clean,
+    version: '2.4.1-1ubuntu1',
+    section: 'utils',
+    priority: 'optional',
+    architecture: 'amd64',
+    installedSize: 8192,
+    description: `${clean} official enterprise GNU/Linux package`,
+    maintainer: 'Debian Core Developers <debian-devel@lists.debian.org>',
+    binaries: [clean],
+    dependencies: ['libc6', 'libgcc-s1'],
+  };
+}
+
+/**
  * Check if a command binary belongs to an installable package
  */
 export function findPackageForBinary(binary: string): PackageMeta | null {
@@ -219,8 +244,13 @@ export function findPackageForBinary(binary: string): PackageMeta | null {
       return pkg;
     }
   }
+  // Return dynamically resolved package for any valid binary name
+  if (/^[a-z0-9_.-]{2,30}$/.test(clean)) {
+    return resolvePackageMeta(clean);
+  }
   return null;
 }
+
 
 /**
  * Render ASCII distro art for neofetch

@@ -135,6 +135,18 @@ function errorResponse(msg, status = 400) {
   return jsonResponse({ success: false, message: msg, error: msg }, status);
 }
 
+function getUserFromToken(tokenOrHeader) {
+  if (!tokenOrHeader) return null;
+  const token = (typeof tokenOrHeader === 'string' ? tokenOrHeader : '').replace('Bearer ', '').trim();
+  if (token.startsWith('ts_jwt_')) {
+    try {
+      return JSON.parse(atob(token.replace('ts_jwt_', '')));
+    } catch (_) {}
+  }
+  return null;
+}
+
+
 // ── Default Workspace Helper ──────────────────────────────────────────────────
 
 function createDefaultWorkspace() {
@@ -589,14 +601,9 @@ export default {
 
         // ── Companies: List (Returns { success: true, companies: [...] })
         if (url.pathname === '/api/companies/list') {
-          const token = url.searchParams.get('token');
-          let currentUserId = null;
-          if (token && token.startsWith('ts_jwt_')) {
-            try {
-              const decoded = JSON.parse(atob(token.replace('ts_jwt_', '')));
-              currentUserId = decoded.id;
-            } catch (_) {}
-          }
+          const token = url.searchParams.get('token') || request.headers.get('Authorization')?.replace('Bearer ', '');
+          const user = getUserFromToken(token);
+          const currentUserId = user?.id || null;
 
           await ensureDefaultWorkspace(db, secret);
           const { results } = await db.prepare('SELECT id, data FROM ts_companies').all();
@@ -616,8 +623,14 @@ export default {
         // ── Companies: Create
         if (url.pathname === '/api/companies/create' && method === 'POST') {
           const body = await request.json();
-          const { name, owner_id } = body;
-          if (!name) return errorResponse('Missing company name');
+          const token = body.token || request.headers.get('Authorization')?.replace('Bearer ', '');
+          const user = getUserFromToken(token);
+          const creatorId = user?.id || body.owner_id || 'user_admin';
+          const creatorUsername = user?.username || 'Owner';
+          const creatorAvatar = user?.avatar_url || null;
+
+          const { name } = body;
+          if (!name || !name.trim()) return errorResponse('Missing company name');
 
           const companyId = `comp_${crypto.randomUUID().slice(0, 8)}`;
           const now = new Date().toISOString();
@@ -625,19 +638,19 @@ export default {
 
           const newComp = {
             id: companyId,
-            name,
+            name: name.trim(),
             join_code: joinCode,
-            logo_url: null,
+            logo_url: body.logo_url || null,
             created_at: now,
             last_activity_at: now,
-            owner_id: owner_id || 'user_admin',
+            owner_id: creatorId,
             members: [
               {
-                user_id: owner_id || 'user_admin',
-                username: 'Owner',
+                user_id: creatorId,
+                username: creatorUsername,
                 role: 'Owner',
                 joined_at: now,
-                avatar_url: null,
+                avatar_url: creatorAvatar,
                 last_active_at: now,
                 total_active_seconds: 0,
               }
@@ -657,7 +670,7 @@ export default {
               title: `${name} Whiteboard`,
               content: '{"elements":[],"appState":{}}',
               updated_at: now,
-              updated_by: 'Owner',
+              updated_by: creatorUsername,
             }
           ];
 
@@ -672,6 +685,135 @@ export default {
           ]);
 
           return jsonResponse({ success: true, company: newComp });
+        }
+
+        // ── Companies: Join with Join Code
+        if (url.pathname === '/api/companies/join' && method === 'POST') {
+          const body = await request.json();
+          const token = body.token || request.headers.get('Authorization')?.replace('Bearer ', '');
+          const user = getUserFromToken(token);
+          const userId = user?.id || 'user_guest';
+          const username = user?.username || 'Member';
+          const avatarUrl = user?.avatar_url || null;
+
+          const joinCode = (body.join_code || body.code || '').trim().toUpperCase();
+          if (!joinCode) return errorResponse('Missing join code');
+
+          const { results } = await db.prepare('SELECT id, data FROM ts_companies').all();
+          let targetComp = null;
+          let targetId = null;
+
+          for (const row of (results || [])) {
+            try {
+              const comp = JSON.parse(await decryptForOrg(row.id, row.data, secret));
+              if (comp.join_code?.toUpperCase() === joinCode || comp.id?.toUpperCase() === joinCode) {
+                targetComp = comp;
+                targetId = row.id;
+                break;
+              }
+            } catch (_) {}
+          }
+
+          if (!targetComp) return errorResponse('Invalid company join code. Workspace not found.', 404);
+
+          // Check if user is already a member
+          if (!targetComp.members) targetComp.members = [];
+          const existingMember = targetComp.members.find(m => m.user_id === userId);
+          if (!existingMember) {
+            targetComp.members.push({
+              user_id: userId,
+              username: username,
+              role: 'Member',
+              joined_at: new Date().toISOString(),
+              avatar_url: avatarUrl,
+              last_active_at: new Date().toISOString(),
+              total_active_seconds: 0,
+            });
+            targetComp.last_activity_at = new Date().toISOString();
+            const encComp = await encryptForOrg(targetId, JSON.stringify(targetComp), secret);
+            await db.prepare('UPDATE ts_companies SET data = ? WHERE id = ?').bind(encComp, targetId).run();
+          }
+
+          return jsonResponse({ success: true, company: targetComp });
+        }
+
+        // ── Companies: Leave Company (For non-owner members)
+        if (url.pathname === '/api/companies/leave' && (method === 'POST' || method === 'DELETE')) {
+          const body = await request.json();
+          const token = body.token || request.headers.get('Authorization')?.replace('Bearer ', '');
+          const user = getUserFromToken(token);
+          if (!user?.id) return errorResponse('Unauthorized', 401);
+
+          const companyId = body.company_id || body.id;
+          if (!companyId) return errorResponse('Missing company_id');
+
+          const row = await db.prepare('SELECT data FROM ts_companies WHERE id = ?').bind(companyId).first();
+          if (!row) return errorResponse('Company not found', 404);
+
+          const comp = JSON.parse(await decryptForOrg(companyId, row.data, secret));
+          if (comp.owner_id === user.id) {
+            return errorResponse('As the owner, you cannot leave this company. You must transfer ownership or delete the company in Danger Zone.');
+          }
+
+          comp.members = (comp.members || []).filter(m => m.user_id !== user.id);
+          comp.last_activity_at = new Date().toISOString();
+          const encComp = await encryptForOrg(companyId, JSON.stringify(comp), secret);
+          await db.prepare('UPDATE ts_companies SET data = ? WHERE id = ?').bind(encComp, companyId).run();
+
+          return jsonResponse({ success: true, message: 'You have left the company.' });
+        }
+
+        // ── Companies: Rename
+        if (url.pathname === '/api/companies/rename' && method === 'POST') {
+          const body = await request.json();
+          const token = body.token || request.headers.get('Authorization')?.replace('Bearer ', '');
+          const user = getUserFromToken(token);
+          const companyId = body.company_id || body.id;
+          const newName = (body.new_name || body.name || '').trim();
+
+          if (!companyId) return errorResponse('Missing company_id');
+          if (!newName) return errorResponse('Missing new company name');
+
+          const row = await db.prepare('SELECT data FROM ts_companies WHERE id = ?').bind(companyId).first();
+          if (!row) return errorResponse('Company not found', 404);
+
+          const comp = JSON.parse(await decryptForOrg(companyId, row.data, secret));
+          if (user && comp.owner_id !== user.id && !comp.members?.some(m => m.user_id === user.id && (m.role === 'Admin' || m.role === 'Owner'))) {
+            return errorResponse('Forbidden: only admins or owner can rename company', 403);
+          }
+
+          comp.name = newName;
+          comp.last_activity_at = new Date().toISOString();
+          const encComp = await encryptForOrg(companyId, JSON.stringify(comp), secret);
+          await db.prepare('UPDATE ts_companies SET data = ? WHERE id = ?').bind(encComp, companyId).run();
+
+          return jsonResponse({ success: true, company: comp });
+        }
+
+        // ── Companies: Update Logo
+        if (url.pathname === '/api/companies/logo' && method === 'POST') {
+          const body = await request.json();
+          const token = body.token || request.headers.get('Authorization')?.replace('Bearer ', '');
+          const user = getUserFromToken(token);
+          const companyId = body.company_id || body.id;
+          const logoUrl = body.logo_url !== undefined ? body.logo_url : (body.logo || null);
+
+          if (!companyId) return errorResponse('Missing company_id');
+
+          const row = await db.prepare('SELECT data FROM ts_companies WHERE id = ?').bind(companyId).first();
+          if (!row) return errorResponse('Company not found', 404);
+
+          const comp = JSON.parse(await decryptForOrg(companyId, row.data, secret));
+          if (user && comp.owner_id !== user.id && !comp.members?.some(m => m.user_id === user.id && (m.role === 'Admin' || m.role === 'Owner'))) {
+            return errorResponse('Forbidden: only admins or owner can update logo', 403);
+          }
+
+          comp.logo_url = logoUrl;
+          comp.last_activity_at = new Date().toISOString();
+          const encComp = await encryptForOrg(companyId, JSON.stringify(comp), secret);
+          await db.prepare('UPDATE ts_companies SET data = ? WHERE id = ?').bind(encComp, companyId).run();
+
+          return jsonResponse({ success: true, company: comp });
         }
 
         // ── Companies: Touch Activity (Retention Lifecycle)
@@ -729,8 +871,19 @@ export default {
         // ── Companies: Full Permanent Purge / Deletion
         if ((url.pathname === '/api/companies/delete' || url.pathname === '/api/org/purge') && (method === 'POST' || method === 'DELETE')) {
           const body = await request.json();
+          const token = body.token || request.headers.get('Authorization')?.replace('Bearer ', '');
+          const user = getUserFromToken(token);
           const companyId = body.company_id || body.id;
           if (!companyId) return errorResponse('Missing company_id');
+
+          // Check if caller is owner or admin (or comp_theysynced protection)
+          const compRow = await db.prepare('SELECT data FROM ts_companies WHERE id = ?').bind(companyId).first();
+          if (compRow) {
+            const comp = JSON.parse(await decryptForOrg(companyId, compRow.data, secret));
+            if (user && comp.owner_id !== user.id && user.role !== 'Admin') {
+              return errorResponse('Forbidden: only company owner can permanently delete this organization', 403);
+            }
+          }
 
           // Eradicate all media files in Cloudflare KV / R2
           await purgeOrgMedia(companyId, db, env, secret);
