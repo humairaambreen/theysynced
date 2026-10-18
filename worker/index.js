@@ -238,6 +238,60 @@ async function addUserToCompany(db, companyId, userId, username, secret) {
   } catch (_) {}
 }
 
+async function purgeOrgMedia(companyId, db, env, secret) {
+  try {
+    const keysToDelete = new Set();
+    
+    // 1. Collect all storage URLs from ts_assets
+    const assetsRow = await db.prepare('SELECT data FROM ts_assets WHERE company_id = ?').bind(companyId).first();
+    if (assetsRow) {
+      try {
+        const assets = JSON.parse(await decryptForOrg(companyId, assetsRow.data, secret));
+        for (const a of assets) {
+          if (a.url && a.url.startsWith('/api/storage/file/')) {
+            const parts = a.url.replace('/api/storage/file/', '').split('/');
+            if (parts.length >= 2) {
+              const fileId = parts[0];
+              const fileName = parts.slice(1).join('/');
+              keysToDelete.add(`${fileId}_${fileName}`);
+            }
+          }
+        }
+      } catch (_) {}
+    }
+
+    // 2. Collect all storage URLs from ts_messages
+    const { results: msgRows } = await db.prepare('SELECT key, data FROM ts_messages WHERE key = ? OR key LIKE ?').bind(companyId, `team_${companyId}_%`).all();
+    for (const m of (msgRows || [])) {
+      try {
+        const msgs = JSON.parse(await decryptForOrg(null, m.data, secret));
+        for (const msg of msgs) {
+          if (msg.file_attachment?.url && msg.file_attachment.url.startsWith('/api/storage/file/')) {
+            const parts = msg.file_attachment.url.replace('/api/storage/file/', '').split('/');
+            if (parts.length >= 2) {
+              const fileId = parts[0];
+              const fileName = parts.slice(1).join('/');
+              keysToDelete.add(`${fileId}_${fileName}`);
+            }
+          }
+        }
+      } catch (_) {}
+    }
+
+    // 3. Purge all collected keys from KV or R2
+    for (const key of keysToDelete) {
+      if (env.MEDIA_BUCKET) {
+        await env.MEDIA_BUCKET.delete(key).catch(() => {});
+      } else if (env.theysynced_media) {
+        await env.theysynced_media.delete(key).catch(() => {});
+      }
+    }
+    console.log(`[Storage Purge] Eradicated ${keysToDelete.size} media files for organization ${companyId}`);
+  } catch (err) {
+    console.warn('[Storage Purge Warning]', err);
+  }
+}
+
 // ── Cloudflare Worker Main Export ─────────────────────────────────────────────
 
 export default {
@@ -678,6 +732,9 @@ export default {
           const companyId = body.company_id || body.id;
           if (!companyId) return errorResponse('Missing company_id');
 
+          // Eradicate all media files in Cloudflare KV / R2
+          await purgeOrgMedia(companyId, db, env, secret);
+
           await db.batch([
             db.prepare('DELETE FROM ts_companies WHERE id = ?').bind(companyId),
             db.prepare('DELETE FROM ts_teams WHERE company_id = ?').bind(companyId),
@@ -981,6 +1038,9 @@ export default {
           const lastActive = comp.last_activity_at ? new Date(comp.last_activity_at).getTime() : new Date(comp.created_at).getTime();
           if (now - lastActive >= ninetyDaysMs) {
             console.warn(`[Cloudflare Retention] Permanently purging inactive organization: ${row.id}`);
+            // Eradicate all media files in Cloudflare KV / R2
+            await purgeOrgMedia(row.id, env.theysynced_db, env, secret);
+
             await env.theysynced_db.batch([
               env.theysynced_db.prepare('DELETE FROM ts_companies WHERE id = ?').bind(row.id),
               env.theysynced_db.prepare('DELETE FROM ts_teams WHERE company_id = ?').bind(row.id),

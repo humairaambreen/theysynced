@@ -113,6 +113,6 @@ export interface CallParticipant {
   joined_at: string;
 }
 
-export type ActiveTab = 'overview' | 'teams' | 'rdp' | 'whiteboard' | 'spreadsheet' | 'docs' | 'assets' | 'activity';
+export type ActiveTab = 'overview' | 'teams' | 'assets' | 'terminal' | 'rdp' | 'whiteboard' | 'spreadsheet' | 'docs' | 'activity';
 
 

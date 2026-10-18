@@ -19,6 +19,7 @@ import { Building2, AlertTriangle } from 'lucide-react';
 import { getAllOfflineAssets } from './lib/offlineStore';
 import { InviteModal } from './components/InviteModal';
 import { RdpView } from './components/RdpView';
+import { SharedTerminalView } from './components/SharedTerminalView';
 
 
 
@@ -48,6 +49,7 @@ export default function App() {
 
   const [assets, setAssets] = useState<WorkspaceAsset[]>([]);
   const [activeTeamId, setActiveTeamId] = useState<string | undefined>(undefined);
+  const [terminalInitialPath, setTerminalInitialPath] = useState<string>('/workspace');
 
   const [screenSeconds, setScreenSeconds] = useState(0);
   const currentChannelIdRef = useRef<string | undefined>(undefined);
@@ -75,6 +77,8 @@ export default function App() {
       }
     } else if (tab === 'assets') {
       path = '/assets';
+    } else if (tab === 'terminal') {
+      path = '/terminal';
     } else if (tab === 'whiteboard') {
       path = '/whiteboard';
     } else if (tab === 'spreadsheet') {
@@ -89,6 +93,34 @@ export default function App() {
 
     if (window.location.pathname !== path) {
       window.history.pushState(null, '', path);
+    }
+  };
+
+  // Central tab navigation handler supporting deep subitem selection
+  const handleNavigateTab = (tab: ActiveTab, subItem?: string) => {
+    if (tab === 'teams') {
+      if (subItem) setActiveTeamId(subItem);
+      setActiveTab('teams');
+      syncUrl('teams', subItem);
+    } else if (tab === 'terminal') {
+      if (subItem) setTerminalInitialPath(subItem);
+      setActiveTab('terminal');
+      syncUrl('terminal');
+    } else if (tab === 'assets') {
+      setActiveTab('assets');
+      syncUrl('assets');
+    } else if (tab === 'spreadsheet') {
+      setActiveTab('spreadsheet');
+      syncUrl('spreadsheet');
+    } else if (tab === 'whiteboard') {
+      setActiveTab('whiteboard');
+      syncUrl('whiteboard');
+    } else if (tab === 'docs') {
+      setActiveTab('docs');
+      syncUrl('docs');
+    } else {
+      setActiveTab(tab);
+      syncUrl(tab);
     }
   };
 
@@ -111,8 +143,10 @@ export default function App() {
           setActiveTeamId(found.id);
         }
       }
-    } else if (section === 'assets' || section === 'storage') {
+    } else if (section === 'assets' || section === 'storage' || section === 'files') {
       setActiveTab('assets');
+    } else if (section === 'terminal' || section === 'linux' || section === 'shell') {
+      setActiveTab('terminal');
     } else if (section === 'whiteboard' || section === 'excalidraw') {
       setActiveTab('whiteboard');
     } else if (section === 'spreadsheet' || section === 'sheets') {
@@ -947,14 +981,32 @@ export default function App() {
             />
           )}
 
-          {activeTab === 'assets' && activeCompany && (
+          {activeTab === 'assets' && activeCompany && user && (
             <SharedAssetsView
               user={user}
               company={activeCompany}
+              teams={teams}
+              chatMessages={chatMessages}
               assets={assets}
               onSaveAsset={handleSaveAsset}
               onDeleteAsset={handleDeleteAsset}
               onRefreshAssets={() => token && fetchAssets(token, activeCompany.id)}
+              onNavigateTab={handleNavigateTab}
+            />
+          )}
+
+          {activeTab === 'terminal' && activeCompany && user && (
+            <SharedTerminalView
+              user={user}
+              company={activeCompany}
+              teams={teams}
+              chatMessages={chatMessages}
+              assets={assets}
+              websocket={websocket}
+              onSaveAsset={handleSaveAsset}
+              onDeleteAsset={handleDeleteAsset}
+              onNavigateTab={handleNavigateTab}
+              initialPath={terminalInitialPath}
             />
           )}
 

@@ -1,33 +1,41 @@
 'use client';
 
 import React, { useState, useMemo } from 'react';
-import { Company, UserProfile, WorkspaceAsset } from '../types';
+import { Company, Team, ChatMessage, UserProfile, WorkspaceAsset, ActiveTab } from '../types';
 import { 
   Folder, FolderPlus, Upload, Search, Trash2, Edit2, Download, 
   ExternalLink, Eye, ChevronRight, FileText, Image, Video, Music, 
   FileCode, File, Globe, Lock, Check, X, ShieldAlert, Sparkles, 
-  ArrowLeft, HardDrive, RefreshCw, MessageSquare
+  ArrowLeft, HardDrive, RefreshCw, MessageSquare, Terminal, Table, 
+  PenTool, Code, CheckCircle
 } from 'lucide-react';
 import { ConfirmModal } from './ConfirmModal';
+import { buildCompanyLinuxFilesystem } from '../lib/linuxFilesystem';
 
 interface SharedAssetsViewProps {
   user: UserProfile;
   company: Company;
+  teams: Team[];
+  chatMessages: ChatMessage[];
   assets: WorkspaceAsset[];
   onSaveAsset: (asset: Partial<WorkspaceAsset>) => Promise<void>;
   onDeleteAsset: (assetId: string) => Promise<void>;
   onRefreshAssets?: () => void;
+  onNavigateTab?: (tab: ActiveTab, subItem?: string) => void;
 }
 
-type FilterType = 'all' | 'images' | 'videos' | 'audio' | 'documents' | 'chat';
+type FilterType = 'all' | 'images' | 'videos' | 'audio' | 'documents' | 'spreadsheets' | 'drawings' | 'chat';
 
 export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
   user,
   company,
+  teams,
+  chatMessages,
   assets,
   onSaveAsset,
   onDeleteAsset,
   onRefreshAssets,
+  onNavigateTab,
 }) => {
   // Navigation State: Breadcrumb path of folder IDs / virtual path
   const [currentPath, setCurrentPath] = useState<string[]>(['root']);
@@ -38,6 +46,10 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
   const [showNewFolderModal, setShowNewFolderModal] = useState(false);
   const [newFolderName, setNewFolderName] = useState('');
   const [newFolderScope, setNewFolderScope] = useState<'shared' | 'private'>('shared');
+
+  const [showNewFileModal, setShowNewFileModal] = useState(false);
+  const [newFileName, setNewFileName] = useState('');
+  const [newFileContent, setNewFileContent] = useState('');
   
   const [renameTarget, setRenameTarget] = useState<WorkspaceAsset | null>(null);
   const [renameValue, setRenameValue] = useState('');
@@ -46,6 +58,7 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
   const [copiedLink, setCopiedLink] = useState<string | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [exportNotice, setExportNotice] = useState<string | null>(null);
 
   // Confirm Modal Config
   const [confirmConfig, setConfirmConfig] = useState<{
@@ -55,7 +68,14 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
     onConfirm: () => void;
   } | null>(null);
 
-  // Determine if current user is admin or owner
+  const companySlug = useMemo(() => {
+    return (company.name || 'org')
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '') || company.id.slice(0, 8);
+  }, [company.name, company.id]);
+
   const isAdmin = useMemo(() => {
     if (company.owner_id === user.id) return true;
     return (company.members || []).some(
@@ -63,18 +83,32 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
     );
   }, [company, user.id]);
 
-  // Filter accessible assets based on permission & scoping rules
+  // Unified Company Linux Filesystem & Virtual Assets
+  const { entries: linuxEntries, virtualAssets: linuxVirtualAssets } = useMemo(() => {
+    return buildCompanyLinuxFilesystem(company, teams, chatMessages, assets, user);
+  }, [company, teams, chatMessages, assets, user]);
+
+  // Merged Assets: Real D1 assets + Linux generated system assets
+  const mergedAssets = useMemo(() => {
+    const list = [...assets];
+    linuxVirtualAssets.forEach((va) => {
+      if (!list.some((a) => a.name === va.name && a.folder_path === va.folder_path)) {
+        list.push(va);
+      }
+    });
+    return list;
+  }, [assets, linuxVirtualAssets]);
+
+  // Filter accessible assets based on permission rules
   const accessibleAssets = useMemo(() => {
-    return assets.filter((asset) => {
-      // 1. If it's a DM asset (e.g. chat files or DM folder)
+    return mergedAssets.filter((asset) => {
       if (asset.scope === 'dm' || asset.folder_path?.includes('/Direct Messages/')) {
-        if (isAdmin) return true; // Admins have full platform visibility
+        if (isAdmin) return true;
         if (asset.allowed_users && asset.allowed_users.length > 0) {
           return asset.allowed_users.some(
             (u) => u.toLowerCase() === user.username.toLowerCase()
           );
         }
-        // Try parsing usernames from folder_path e.g. /Chat Attachments/Direct Messages/@aryan & @humaira
         const dmMatch = asset.folder_path?.match(/@([a-zA-Z0-9_.-]+)\s*&\s*@([a-zA-Z0-9_.-]+)/);
         if (dmMatch) {
           const u1 = dmMatch[1].toLowerCase();
@@ -85,23 +119,32 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
         return false;
       }
 
-      // 2. If it's private to a specific user
       if (asset.scope === 'private') {
         if (isAdmin) return true;
         return asset.created_by.toLowerCase() === user.username.toLowerCase();
       }
 
-      // 3. Otherwise it's shared across the company
       return true;
     });
-  }, [assets, isAdmin, user.username]);
+  }, [mergedAssets, isAdmin, user.username]);
 
-  // Construct Virtual & Stored Folder Tree
   const currentFolderId = currentPath[currentPath.length - 1];
 
-  // Helper to get items in the current folder
+  // Derive Current Linux Path for Terminal cd
+  const currentLinuxPath = useMemo(() => {
+    if (currentFolderId === 'root') return '/workspace';
+    if (currentFolderId === 'v_linux_chats') return '/workspace/chats';
+    if (currentFolderId === 'v_linux_sheets') return '/workspace/spreadsheets';
+    if (currentFolderId === 'v_linux_drawings') return '/workspace/drawings';
+    if (currentFolderId === 'v_linux_docs') return '/workspace/docs';
+    if (currentFolderId === 'v_linux_files') return '/workspace/files';
+    if (currentFolderId === 'v_linux_export') return '/workspace/export';
+    const f = accessibleAssets.find((a) => a.id === currentFolderId);
+    return f ? `/workspace/${f.name}` : '/workspace';
+  }, [currentFolderId, accessibleAssets]);
+
+  // Items in Current Folder
   const currentItems = useMemo<WorkspaceAsset[]>(() => {
-    // If user is searching, return matching files across all accessible assets
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase();
       return accessibleAssets.filter((a) => {
@@ -118,175 +161,250 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
         (a) => a.asset_type === 'folder' && (!a.parent_id || a.parent_id === 'root') && !a.folder_path?.startsWith('/Chat Attachments')
       );
 
-      const virtualFolders: WorkspaceAsset[] = [
+      const linuxSystemFolders: WorkspaceAsset[] = [
         {
-          id: 'v_chat_attachments',
+          id: 'v_linux_chats',
           company_id: company.id,
           asset_type: 'folder',
-          name: 'Chat Attachments',
-          created_by: 'System',
+          name: 'chats',
+          created_by: 'Linux Kernel',
           updated_at: new Date().toISOString(),
-          folder_path: '/Chat Attachments',
+          folder_path: '/workspace/chats',
           scope: 'shared',
         },
         {
-          id: 'v_company_shared',
+          id: 'v_linux_sheets',
           company_id: company.id,
           asset_type: 'folder',
-          name: 'Company Shared Files',
-          created_by: 'System',
+          name: 'spreadsheets',
+          created_by: 'Linux Kernel',
           updated_at: new Date().toISOString(),
-          folder_path: '/Company Shared Files',
+          folder_path: '/workspace/spreadsheets',
           scope: 'shared',
         },
         {
-          id: 'v_my_private',
+          id: 'v_linux_drawings',
           company_id: company.id,
           asset_type: 'folder',
-          name: 'My Private Files',
-          created_by: user.username,
+          name: 'drawings',
+          created_by: 'Linux Kernel',
           updated_at: new Date().toISOString(),
-          folder_path: `/Users/${user.username}`,
-          scope: 'private',
+          folder_path: '/workspace/drawings',
+          scope: 'shared',
+        },
+        {
+          id: 'v_linux_docs',
+          company_id: company.id,
+          asset_type: 'folder',
+          name: 'docs',
+          created_by: 'Linux Kernel',
+          updated_at: new Date().toISOString(),
+          folder_path: '/workspace/docs',
+          scope: 'shared',
+        },
+        {
+          id: 'v_linux_files',
+          company_id: company.id,
+          asset_type: 'folder',
+          name: 'files',
+          created_by: 'Linux Kernel',
+          updated_at: new Date().toISOString(),
+          folder_path: '/workspace/files',
+          scope: 'shared',
+        },
+        {
+          id: 'v_linux_export',
+          company_id: company.id,
+          asset_type: 'folder',
+          name: 'export',
+          created_by: 'Linux Kernel',
+          updated_at: new Date().toISOString(),
+          folder_path: '/workspace/export',
+          scope: 'shared',
         },
       ];
 
-      return [...virtualFolders, ...customRootFolders];
+      return [...linuxSystemFolders, ...customRootFolders];
     }
 
-    if (currentFolderId === 'v_chat_attachments') {
-      // Show Chat channels and Direct Messages virtual folder
-      const channelSet = new Set<string>();
-      let hasDMs = false;
-
-      accessibleAssets.forEach((a) => {
-        if (a.folder_path?.startsWith('/Chat Attachments/')) {
-          const sub = a.folder_path.replace('/Chat Attachments/', '').split('/')[0];
-          if (sub === 'Direct Messages') {
-            hasDMs = true;
-          } else if (sub) {
-            channelSet.add(sub);
-          }
-        }
-      });
-
-      const list: WorkspaceAsset[] = [];
-      channelSet.forEach((chan) => {
-        list.push({
-          id: `v_chat_${chan}`,
+    // Inside /workspace/chats
+    if (currentFolderId === 'v_linux_chats') {
+      return linuxEntries
+        .filter((e) => e.folder === '/workspace/chats')
+        .map((e): WorkspaceAsset => ({
+          id: `chat_file_${e.name}`,
           company_id: company.id,
-          asset_type: 'folder',
-          name: chan,
-          created_by: 'Chat Bot',
-          updated_at: new Date().toISOString(),
-          folder_path: `/Chat Attachments/${chan}`,
+          asset_type: 'file',
+          name: e.name,
+          folder_path: '/workspace/chats',
+          content: e.content,
+          size: e.size,
+          created_by: e.created_by,
+          updated_at: e.updated_at,
           scope: 'shared',
-        });
-      });
+        }));
+    }
 
-      if (hasDMs) {
-        list.push({
-          id: 'v_chat_dms',
+    // Inside /workspace/spreadsheets
+    if (currentFolderId === 'v_linux_sheets') {
+      return linuxEntries
+        .filter((e) => e.folder === '/workspace/spreadsheets')
+        .map((e): WorkspaceAsset => ({
+          id: e.asset_id || `sheet_${e.name}`,
           company_id: company.id,
-          asset_type: 'folder',
-          name: 'Direct Messages',
-          created_by: 'System',
-          updated_at: new Date().toISOString(),
-          folder_path: '/Chat Attachments/Direct Messages',
-          scope: 'dm',
-        });
-      }
-
-      return list;
+          asset_type: 'spreadsheet',
+          name: e.name,
+          folder_path: '/workspace/spreadsheets',
+          content: e.content,
+          size: e.size,
+          created_by: e.created_by,
+          updated_at: e.updated_at,
+          scope: 'shared',
+        }));
     }
 
-    if (currentFolderId === 'v_chat_dms') {
-      // List all DM conversations where current user is participant (or admin)
-      const dmSet = new Set<string>();
-      accessibleAssets.forEach((a) => {
-        if (a.folder_path?.startsWith('/Chat Attachments/Direct Messages/')) {
-          const dmName = a.folder_path.replace('/Chat Attachments/Direct Messages/', '').split('/')[0];
-          if (dmName) dmSet.add(dmName);
-        }
-      });
-
-      return Array.from(dmSet).map((dmName): WorkspaceAsset => ({
-        id: `v_dm_${dmName}`,
-        company_id: company.id,
-        asset_type: 'folder',
-        name: dmName,
-        created_by: 'System',
-        updated_at: new Date().toISOString(),
-        folder_path: `/Chat Attachments/Direct Messages/${dmName}`,
-        scope: 'dm',
-      }));
+    // Inside /workspace/drawings
+    if (currentFolderId === 'v_linux_drawings') {
+      return linuxEntries
+        .filter((e) => e.folder === '/workspace/drawings')
+        .map((e): WorkspaceAsset => ({
+          id: e.asset_id || `drawing_${e.name}`,
+          company_id: company.id,
+          asset_type: 'whiteboard',
+          name: e.name,
+          folder_path: '/workspace/drawings',
+          content: e.content,
+          size: e.size,
+          created_by: e.created_by,
+          updated_at: e.updated_at,
+          scope: 'shared',
+        }));
     }
 
-    // Inside a specific folder: find child folders and child files
+    // Inside /workspace/docs
+    if (currentFolderId === 'v_linux_docs') {
+      return linuxEntries
+        .filter((e) => e.folder === '/workspace/docs')
+        .map((e): WorkspaceAsset => ({
+          id: e.asset_id || `doc_${e.name}`,
+          company_id: company.id,
+          asset_type: 'doc',
+          name: e.name,
+          folder_path: '/workspace/docs',
+          content: e.content,
+          size: e.size,
+          created_by: e.created_by,
+          updated_at: e.updated_at,
+          scope: 'shared',
+        }));
+    }
+
+    // Inside /workspace/export
+    if (currentFolderId === 'v_linux_export') {
+      return accessibleAssets.filter((a) => a.folder_path === '/workspace/export' || a.name.includes('backup'));
+    }
+
+    // Inside /workspace/files or custom folder
     return accessibleAssets.filter((a) => {
-      // Matched by explicit parent_id
-      if (a.parent_id === currentFolderId || a.folder_id === currentFolderId) return true;
-
-      // Or matched by virtual path prefix
-      if (currentFolderId.startsWith('v_chat_') || currentFolderId.startsWith('v_dm_')) {
-        const folderAsset = accessibleAssets.find((x) => x.id === currentFolderId) || {
-          folder_path: currentFolderId === 'v_company_shared' ? '/Company Shared Files' :
-                       currentFolderId === 'v_my_private' ? `/Users/${user.username}` :
-                       currentFolderId.startsWith('v_dm_') ? `/Chat Attachments/Direct Messages/${currentFolderId.replace('v_dm_', '')}` :
-                       `/Chat Attachments/${currentFolderId.replace('v_chat_', '')}`
-        };
-        if (a.folder_path === folderAsset.folder_path) return true;
+      if (a.parent_id === currentFolderId) return true;
+      if (currentFolderId === 'v_linux_files') {
+        return a.asset_type === 'file' && (!a.folder_path || a.folder_path === '/workspace/files');
       }
-
-      if (currentFolderId === 'v_company_shared') {
-        return a.parent_id === 'v_company_shared' || (a.scope === 'shared' && a.parent_id === 'root' && a.asset_type === 'folder');
-      }
-
-      if (currentFolderId === 'v_my_private') {
-        return a.parent_id === 'v_my_private' || (a.scope === 'private' && a.parent_id === 'root' && a.created_by === user.username);
-      }
-
       return false;
     });
-  }, [accessibleAssets, currentFolderId, searchQuery, company.id, user.username]);
+  }, [accessibleAssets, currentFolderId, searchQuery, company.id, user.username, linuxEntries]);
 
-  // Filter items by type (images, videos, etc.)
+  // Filter items by type
   const filteredItems = useMemo(() => {
     return currentItems.filter((item) => {
-      if (item.asset_type === 'folder') return true; // always show folders
+      if (item.asset_type === 'folder') return true;
       if (activeFilter === 'all') return true;
-      const type = (item.file_type || '').toLowerCase();
       const ext = item.name.split('.').pop()?.toLowerCase() || '';
 
       if (activeFilter === 'images') {
-        return type.startsWith('image/') || ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg'].includes(ext);
+        return ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg'].includes(ext);
       }
       if (activeFilter === 'videos') {
-        return type.startsWith('video/') || ['mp4', 'webm', 'mov', 'mkv', 'avi'].includes(ext);
+        return ['mp4', 'webm', 'mov', 'mkv', 'avi'].includes(ext);
       }
       if (activeFilter === 'audio') {
-        return type.startsWith('audio/') || ['mp3', 'wav', 'ogg', 'm4a', 'flac'].includes(ext);
+        return ['mp3', 'wav', 'ogg', 'm4a', 'flac'].includes(ext);
+      }
+      if (activeFilter === 'spreadsheets') {
+        return ext === 'csv' || item.name.endsWith('.sheet.json') || item.asset_type === 'spreadsheet';
+      }
+      if (activeFilter === 'drawings') {
+        return item.name.endsWith('.excalidraw.json') || item.asset_type === 'whiteboard';
       }
       if (activeFilter === 'documents') {
-        return type.includes('pdf') || type.includes('document') || type.includes('text') || ['pdf', 'doc', 'docx', 'txt', 'md', 'csv', 'xlsx'].includes(ext);
+        return ext === 'md' || item.name.endsWith('.doc.json') || ext === 'pdf' || ext === 'txt' || item.asset_type === 'doc';
       }
       if (activeFilter === 'chat') {
-        return item.folder_path?.startsWith('/Chat Attachments');
+        return item.folder_path?.includes('chats') || ext === 'log' || item.name.endsWith('.chat.json');
       }
       return true;
     });
   }, [currentItems, activeFilter]);
 
-  // Handle Breadcrumb clicks
+  // Breadcrumbs Navigation
   const navigateToBreadcrumb = (index: number) => {
     setCurrentPath((prev) => prev.slice(0, index + 1));
     setSearchQuery('');
   };
 
-  // Open a folder
   const handleOpenFolder = (folderId: string) => {
     setCurrentPath((prev) => [...prev, folderId]);
     setSearchQuery('');
+  };
+
+  // Open File in Visualizer Tab
+  const handleOpenInVisualizer = (item: WorkspaceAsset) => {
+    if (!onNavigateTab) return;
+    const name = item.name.toLowerCase();
+
+    if (name.endsWith('.sheet.json') || name.endsWith('.csv') || item.asset_type === 'spreadsheet') {
+      onNavigateTab('spreadsheet', item.id);
+    } else if (name.endsWith('.excalidraw.json') || item.asset_type === 'whiteboard') {
+      onNavigateTab('whiteboard', item.id);
+    } else if (name.endsWith('.doc.json') || name.endsWith('.md') || item.asset_type === 'doc') {
+      onNavigateTab('docs', item.id);
+    } else if (name.endsWith('.chat.json') || name.endsWith('.log') || item.folder_path?.includes('chats')) {
+      // Find channel id
+      const chan = teams.find((t) => t.name.toLowerCase() === name.replace(/\.(log|chat\.json)$/, '').replace(/^dm-/, 'dm:'));
+      onNavigateTab('teams', chan ? chan.id : undefined);
+    } else {
+      setPreviewFile(item);
+    }
+  };
+
+  // Trigger Organization Full Backup
+  const handleExportOrgBackup = () => {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
+    const backupName = `${companySlug}_backup_${timestamp}.json`;
+    
+    // Create complete data bundle
+    const exportBundle = {
+      organization: company,
+      exported_at: new Date().toISOString(),
+      channels: teams,
+      chat_messages: chatMessages,
+      spreadsheets: linuxEntries.filter((e) => e.category === 'spreadsheet'),
+      drawings: linuxEntries.filter((e) => e.category === 'drawing'),
+      docs: linuxEntries.filter((e) => e.category === 'doc'),
+      files: assets.map((a) => ({ name: a.name, type: a.asset_type, url: a.url, size: a.size })),
+    };
+
+    const blob = new Blob([JSON.stringify(exportBundle, null, 2)], { type: 'application/json' });
+    const downloadUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = downloadUrl;
+    a.download = backupName;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+
+    setExportNotice(`Exported full encrypted organization archive: ${backupName}`);
+    setTimeout(() => setExportNotice(null), 6000);
   };
 
   // Create New Folder
@@ -303,6 +421,7 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
       asset_type: 'folder',
       name: newFolderName.trim(),
       parent_id: parentId,
+      folder_path: currentLinuxPath,
       created_by: user.username,
       updated_at: new Date().toISOString(),
       scope: newFolderScope,
@@ -312,7 +431,31 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
     setShowNewFolderModal(false);
   };
 
-  // Handle File Upload into current folder
+  // Create New Code / Script File
+  const handleCreateFile = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newFileName.trim()) return;
+
+    const fileId = `file_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    await onSaveAsset({
+      id: fileId,
+      company_id: company.id,
+      asset_type: newFileName.endsWith('.sheet.json') ? 'spreadsheet' : newFileName.endsWith('.excalidraw.json') ? 'whiteboard' : newFileName.endsWith('.doc.json') || newFileName.endsWith('.md') ? 'doc' : 'file',
+      name: newFileName.trim(),
+      content: newFileContent,
+      size: newFileContent.length,
+      folder_path: currentLinuxPath,
+      created_by: user.username,
+      updated_at: new Date().toISOString(),
+      scope: 'shared',
+    });
+
+    setNewFileName('');
+    setNewFileContent('');
+    setShowNewFileModal(false);
+  };
+
+  // Upload Files into current folder
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
@@ -323,8 +466,6 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
     try {
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
-        
-        // 1. Read as Base64 for Cloudflare Storage API
         const base64Data = await new Promise<string>((resolve, reject) => {
           const reader = new FileReader();
           reader.onload = () => resolve(reader.result as string);
@@ -332,7 +473,6 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
           reader.readAsDataURL(file);
         });
 
-        // 2. Upload to Cloudflare storage endpoint
         const uploadRes = await fetch('/api/storage/upload', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -346,42 +486,37 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
         const uploadData = await uploadRes.json();
         const fileUrl = uploadData.success && uploadData.url ? uploadData.url : base64Data;
 
-        // 3. Save asset record to D1
         const fileId = `file_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-        const scope = currentFolderId.includes('private') ? 'private' : 'shared';
-
         await onSaveAsset({
           id: fileId,
           company_id: company.id,
-          asset_type: 'file',
+          asset_type: file.type?.includes('pdf') ? 'pdf' : 'file',
           name: file.name,
           url: fileUrl,
           file_type: file.type || 'application/octet-stream',
           size: file.size,
-          parent_id: currentFolderId,
-          folder_id: currentFolderId,
+          parent_id: currentFolderId === 'root' ? 'root' : currentFolderId,
+          folder_path: currentLinuxPath,
           created_by: user.username,
           updated_at: new Date().toISOString(),
-          scope: scope,
+          scope: 'shared',
         });
       }
     } catch (err: any) {
-      console.error('File upload error:', err);
-      setUploadError(err.message || 'Failed to upload file.');
+      setUploadError(err.message || 'File upload failed');
     } finally {
       setIsUploading(false);
       e.target.value = '';
     }
   };
 
-  // Rename asset or folder
-  const handleRenameSubmit = async (e: React.FormEvent) => {
+  // Rename File
+  const handleRename = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!renameTarget || !renameValue.trim()) return;
 
     await onSaveAsset({
       id: renameTarget.id,
-      company_id: company.id,
       name: renameValue.trim(),
       updated_at: new Date().toISOString(),
     });
@@ -390,15 +525,12 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
     setRenameValue('');
   };
 
-  // Delete asset or folder
-  const handleDeleteItem = (item: WorkspaceAsset) => {
-    const isFolder = item.asset_type === 'folder';
+  // Delete Item
+  const handleDelete = (item: WorkspaceAsset) => {
     setConfirmConfig({
       isOpen: true,
-      title: `Delete ${isFolder ? 'Folder' : 'File'}`,
-      message: `Are you sure you want to delete "${item.name}"? ${
-        isFolder ? 'All sub-folders and files inside will also be removed.' : 'This action cannot be undone.'
-      }`,
+      title: `Delete ${item.asset_type === 'folder' ? 'Folder' : 'File'}`,
+      message: `Are you sure you want to permanently delete "${item.name}" from company storage and Linux filesystem?`,
       onConfirm: async () => {
         await onDeleteAsset(item.id);
         setConfirmConfig(null);
@@ -406,86 +538,97 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
     });
   };
 
-  // Copy shareable link to clipboard
-  const handleCopyLink = (url?: string) => {
-    if (!url) return;
-    const fullUrl = url.startsWith('http') ? url : `${window.location.origin}${url}`;
-    navigator.clipboard.writeText(fullUrl);
-    setCopiedLink(url);
-    setTimeout(() => setCopiedLink(null), 2500);
-  };
-
-  // Human readable file size formatter
-  const formatFileSize = (bytes?: number) => {
-    if (!bytes || bytes === 0) return '0 B';
-    const k = 1024;
-    const sizes = ['B', 'KB', 'MB', 'GB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
-  };
-
-  // Icon helper based on file type
-  const getFileIcon = (item: WorkspaceAsset) => {
+  // Helper to choose item icon
+  const getItemIcon = (item: WorkspaceAsset) => {
     if (item.asset_type === 'folder') {
-      return <Folder className="w-8 h-8 text-amber-500 fill-amber-100" />;
+      return <Folder className="w-5 h-5 text-indigo-500 shrink-0 fill-indigo-50" />;
     }
-    const type = (item.file_type || '').toLowerCase();
-    const ext = item.name.split('.').pop()?.toLowerCase() || '';
-
-    if (type.startsWith('image/') || ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg'].includes(ext)) {
-      return <Image className="w-8 h-8 text-indigo-500" />;
+    const name = item.name.toLowerCase();
+    if (name.endsWith('.sheet.json') || name.endsWith('.csv') || item.asset_type === 'spreadsheet') {
+      return <Table className="w-5 h-5 text-emerald-600 shrink-0" />;
     }
-    if (type.startsWith('video/') || ['mp4', 'webm', 'mov', 'mkv'].includes(ext)) {
-      return <Video className="w-8 h-8 text-rose-500" />;
+    if (name.endsWith('.excalidraw.json') || item.asset_type === 'whiteboard') {
+      return <PenTool className="w-5 h-5 text-purple-600 shrink-0" />;
     }
-    if (type.startsWith('audio/') || ['mp3', 'wav', 'ogg', 'm4a'].includes(ext)) {
-      return <Music className="w-8 h-8 text-emerald-500" />;
+    if (name.endsWith('.doc.json') || name.endsWith('.md') || item.asset_type === 'doc') {
+      return <FileText className="w-5 h-5 text-blue-600 shrink-0" />;
     }
-    if (type.includes('pdf') || ext === 'pdf') {
-      return <FileText className="w-8 h-8 text-red-600" />;
+    if (name.endsWith('.chat.json') || name.endsWith('.log') || item.folder_path?.includes('chats')) {
+      return <MessageSquare className="w-5 h-5 text-cyan-600 shrink-0" />;
     }
-    if (['json', 'js', 'ts', 'jsx', 'tsx', 'html', 'css', 'rs', 'py'].includes(ext)) {
-      return <FileCode className="w-8 h-8 text-cyan-600" />;
+    if (['py', 'sh', 'js', 'json', 'ts'].includes(name.split('.').pop() || '')) {
+      return <Code className="w-5 h-5 text-amber-500 shrink-0" />;
     }
-    return <File className="w-8 h-8 text-slate-400" />;
+    return <File className="w-5 h-5 text-slate-400 shrink-0" />;
   };
 
   return (
-    <div className="flex-1 flex flex-col h-full bg-[#F8F9FB] select-none overflow-hidden">
+    <div className="flex-1 flex flex-col h-full bg-[#FAFAF8] overflow-hidden font-sans">
       
-      {/* Top Header Bar */}
-      <header className="px-6 py-5 bg-white border-b border-black/[0.05] flex flex-col md:flex-row md:items-center justify-between gap-4 shrink-0 shadow-sm">
-        <div>
-          <div className="flex items-center space-x-2.5">
-            <div className="p-2 bg-indigo-50 rounded-xl text-indigo-600">
-              <HardDrive className="w-5 h-5" />
+      {/* Top Banner & Global Action Bar */}
+      <header className="px-6 py-4 bg-white border-b border-black/[0.04] flex flex-col md:flex-row md:items-center justify-between gap-4 shrink-0">
+        <div className="flex items-center space-x-3">
+          <div className="p-2.5 bg-indigo-50 rounded-2xl text-indigo-600 border border-indigo-100 shadow-sm">
+            <HardDrive className="w-5 h-5" />
+          </div>
+          <div>
+            <div className="flex items-center space-x-2">
+              <h1 className="text-base font-black text-slate-900 tracking-tight">Linux File System (GUI)</h1>
+              <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200 flex items-center">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 mr-1.5 animate-pulse" />
+                theysynced-{companySlug}
+              </span>
             </div>
-            <div>
-              <h1 className="text-lg font-black text-slate-900 tracking-tight">Shared Assets & Cloud Storage</h1>
-              <p className="text-xs text-slate-500">
-                Encrypted edge storage with nested folders, chat attachments, and granular access controls.
-              </p>
-            </div>
+            <p className="text-xs text-slate-500">
+              Unified graphical frontend for company Linux filesystem &bull; Direct visualizer interoperability
+            </p>
           </div>
         </div>
 
-        {/* Global Actions */}
-        <div className="flex items-center space-x-2.5">
-          <label className="flex items-center space-x-2 px-4 py-2 bg-slate-950 text-white hover:bg-slate-800 text-xs font-bold rounded-xl cursor-pointer shadow-md transition-all active:scale-95">
-            <Upload className="w-3.5 h-3.5" />
-            <span>Upload Files</span>
-            <input 
-              type="file" 
-              multiple 
-              onChange={handleFileUpload} 
-              className="hidden" 
-              disabled={isUploading}
-            />
+        {/* Action Controls */}
+        <div className="flex items-center flex-wrap gap-2">
+          {/* Open in Linux Terminal */}
+          {onNavigateTab && (
+            <button
+              onClick={() => onNavigateTab('terminal', currentLinuxPath)}
+              className="flex items-center space-x-1.5 px-3 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-bold shadow-sm transition-all active:scale-95"
+              title="Open Shell in Linux Terminal"
+            >
+              <Terminal className="w-3.5 h-3.5 text-emerald-400" />
+              <span>Open in Terminal</span>
+            </button>
+          )}
+
+          {/* Export Org Backup */}
+          <button
+            onClick={handleExportOrgBackup}
+            className="flex items-center space-x-1.5 px-3 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-bold shadow-sm transition-all active:scale-95"
+            title="Export Full Organization Archive (Chats, Sheets, Drawings, Docs, Files)"
+          >
+            <Download className="w-3.5 h-3.5" />
+            <span>Export Org Backup</span>
+          </button>
+
+          {/* Upload Files */}
+          <label className="flex items-center space-x-1.5 px-3 py-2 bg-white border border-slate-200 text-slate-700 hover:bg-slate-50 rounded-xl text-xs font-bold cursor-pointer shadow-sm transition-all active:scale-95">
+            <Upload className="w-3.5 h-3.5 text-indigo-600" />
+            <span>Upload</span>
+            <input type="file" multiple onChange={handleFileUpload} className="hidden" disabled={isUploading} />
           </label>
 
+          {/* New Script / Code File */}
+          <button
+            onClick={() => setShowNewFileModal(true)}
+            className="flex items-center space-x-1.5 px-3 py-2 bg-white border border-slate-200 text-slate-700 hover:bg-slate-50 rounded-xl text-xs font-bold shadow-sm transition-all active:scale-95"
+          >
+            <Code className="w-3.5 h-3.5 text-amber-500" />
+            <span>New File</span>
+          </button>
+
+          {/* New Folder */}
           <button
             onClick={() => setShowNewFolderModal(true)}
-            className="flex items-center space-x-2 px-3.5 py-2 bg-white border border-slate-200 text-slate-700 hover:bg-slate-50 text-xs font-bold rounded-xl shadow-sm transition-all active:scale-95"
+            className="flex items-center space-x-1.5 px-3 py-2 bg-white border border-slate-200 text-slate-700 hover:bg-slate-50 rounded-xl text-xs font-bold shadow-sm transition-all active:scale-95"
           >
             <FolderPlus className="w-3.5 h-3.5 text-indigo-600" />
             <span>New Folder</span>
@@ -503,238 +646,169 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
         </div>
       </header>
 
-      {/* Filter and Search Bar */}
-      <div className="px-6 py-3.5 bg-white/70 backdrop-blur-sm border-b border-black/[0.03] flex flex-col sm:flex-row items-center justify-between gap-3 shrink-0">
-        
-        {/* Breadcrumb Path */}
-        <div className="flex items-center space-x-1.5 text-xs text-slate-600 overflow-x-auto w-full sm:w-auto py-1">
+      {/* Export Alert Notification */}
+      {exportNotice && (
+        <div className="bg-emerald-50 border-b border-emerald-200 px-6 py-2 flex items-center justify-between text-xs text-emerald-800 font-semibold animate-in fade-in">
+          <div className="flex items-center space-x-2">
+            <CheckCircle className="w-4 h-4 text-emerald-600" />
+            <span>{exportNotice}</span>
+          </div>
+          <button onClick={() => setExportNotice(null)} className="text-emerald-600 hover:text-emerald-900">
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+
+      {/* Breadcrumb Path & Filters */}
+      <div className="px-6 py-3 bg-white/60 backdrop-blur-sm border-b border-black/[0.03] flex flex-col md:flex-row items-center justify-between gap-3 shrink-0">
+        {/* Linux Path Breadcrumbs */}
+        <div className="flex items-center space-x-1.5 text-xs text-slate-600 overflow-x-auto w-full md:w-auto py-1 font-mono">
           <button 
             onClick={() => navigateToBreadcrumb(0)}
-            className="font-bold hover:text-indigo-600 flex items-center space-x-1 shrink-0 px-1.5 py-1 rounded-lg hover:bg-slate-100"
+            className="font-bold text-slate-800 hover:text-indigo-600 flex items-center space-x-1 shrink-0 px-2 py-1 rounded-lg hover:bg-slate-100"
           >
-            <span>All Assets</span>
+            <span>/workspace</span>
           </button>
 
           {currentPath.slice(1).map((segment, idx) => {
-            const label = segment.startsWith('v_chat_') ? `#${segment.replace('v_chat_', '')}` :
-                          segment === 'v_chat_attachments' ? 'Chat Attachments' :
-                          segment === 'v_chat_dms' ? 'Direct Messages' :
-                          segment === 'v_company_shared' ? 'Company Shared' :
-                          segment === 'v_my_private' ? 'My Private' :
-                          segment.startsWith('v_dm_') ? segment.replace('v_dm_', '') :
-                          accessibleAssets.find((a) => a.id === segment)?.name || segment;
-
+            const folderObj = accessibleAssets.find((a) => a.id === segment);
+            const label = segment.replace(/^v_linux_/, '');
             return (
               <React.Fragment key={segment}>
                 <ChevronRight className="w-3.5 h-3.5 text-slate-400 shrink-0" />
                 <button
                   onClick={() => navigateToBreadcrumb(idx + 1)}
-                  className={`font-semibold hover:text-indigo-600 truncate max-w-[150px] px-1.5 py-1 rounded-lg hover:bg-slate-100 ${
-                    idx === currentPath.length - 2 ? 'text-indigo-600 font-bold bg-indigo-50/60' : ''
+                  className={`font-semibold hover:text-indigo-600 truncate max-w-[160px] px-2 py-1 rounded-lg hover:bg-slate-100 ${
+                    idx === currentPath.length - 2 ? 'text-indigo-600 font-bold bg-indigo-50/70' : ''
                   }`}
                 >
-                  {label}
+                  {folderObj?.name || label}
                 </button>
               </React.Fragment>
             );
           })}
         </div>
 
-        {/* Search & Media Filter Controls */}
-        <div className="flex items-center space-x-2.5 w-full sm:w-auto justify-end">
-          <div className="relative w-full sm:w-64">
+        {/* Filter Pills & Search */}
+        <div className="flex items-center space-x-2 w-full md:w-auto justify-end">
+          <div className="relative w-full md:w-56">
             <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
             <input
               type="text"
-              placeholder="Search files, extensions..."
+              placeholder="Search files, logs..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full pl-9 pr-3 py-1.5 bg-slate-100/70 border border-slate-200/80 rounded-xl text-xs focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500"
+              className="w-full pl-9 pr-3 py-1.5 bg-slate-100 border border-slate-200 rounded-xl text-xs focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
             />
-            {searchQuery && (
-              <button 
-                onClick={() => setSearchQuery('')}
-                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
-              >
-                <X className="w-3 h-3" />
-              </button>
-            )}
           </div>
 
-          <div className="hidden md:flex items-center bg-slate-100/80 p-1 rounded-xl text-[11px] font-semibold text-slate-600">
-            {(['all', 'images', 'videos', 'audio', 'documents', 'chat'] as FilterType[]).map((f) => (
-              <button
-                key={f}
-                onClick={() => setActiveFilter(f)}
-                className={`px-2.5 py-1 rounded-lg capitalize transition-all ${
-                  activeFilter === f ? 'bg-white text-indigo-600 shadow-sm font-bold' : 'hover:text-slate-900'
-                }`}
-              >
-                {f}
-              </button>
-            ))}
-          </div>
+          <select
+            value={activeFilter}
+            onChange={(e) => setActiveFilter(e.target.value as FilterType)}
+            className="px-2.5 py-1.5 bg-white border border-slate-200 rounded-xl text-xs font-semibold text-slate-700 focus:outline-none"
+          >
+            <option value="all">All Files</option>
+            <option value="spreadsheets">Spreadsheets</option>
+            <option value="drawings">Drawings</option>
+            <option value="documents">Docs & MD</option>
+            <option value="chat">Chat Logs</option>
+            <option value="images">Images</option>
+            <option value="videos">Videos</option>
+          </select>
         </div>
       </div>
 
-      {/* Uploading Progress Indicator */}
-      {isUploading && (
-        <div className="px-6 py-2 bg-indigo-50 text-indigo-700 text-xs font-semibold flex items-center justify-between border-b border-indigo-100 animate-pulse">
-          <div className="flex items-center space-x-2">
-            <div className="w-3.5 h-3.5 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin" />
-            <span>Encrypting and uploading files to Cloudflare edge storage...</span>
-          </div>
-        </div>
-      )}
-
-      {/* Error Banner */}
-      {uploadError && (
-        <div className="px-6 py-2 bg-rose-50 text-rose-700 text-xs font-semibold flex items-center justify-between border-b border-rose-100">
-          <span>{uploadError}</span>
-          <button onClick={() => setUploadError(null)}><X className="w-3 h-3" /></button>
-        </div>
-      )}
-
-      {/* Main Explorer Content Grid */}
-      <div className="flex-1 overflow-y-auto p-6">
+      {/* Main Filesystem View */}
+      <div className="flex-1 p-6 overflow-y-auto">
         {filteredItems.length === 0 ? (
-          <div className="h-full flex flex-col items-center justify-center text-center p-8 text-slate-400">
-            <div className="w-16 h-16 rounded-3xl bg-slate-100 flex items-center justify-center mb-4">
-              <Folder className="w-8 h-8 text-slate-300" />
-            </div>
-            <h3 className="text-sm font-bold text-slate-700 mb-1">No items found</h3>
-            <p className="text-xs max-w-sm text-slate-400 mb-5">
-              {searchQuery 
-                ? 'No files matched your search query in this folder.' 
-                : 'This folder is empty. Upload files or create sub-folders to start organizing.'}
+          <div className="h-64 flex flex-col items-center justify-center text-center p-8 bg-white rounded-3xl border border-dashed border-slate-200">
+            <Folder className="w-10 h-10 text-slate-300 mb-2" />
+            <h3 className="text-sm font-bold text-slate-700">Directory is Empty</h3>
+            <p className="text-xs text-slate-400 mt-1 max-w-sm">
+              Use &quot;Upload&quot;, &quot;New File&quot;, or the Linux Terminal to create files and scripts in this directory.
             </p>
-            <div className="flex items-center space-x-3">
-              <label className="flex items-center space-x-2 px-4 py-2 bg-slate-950 text-white hover:bg-slate-800 text-xs font-bold rounded-xl cursor-pointer shadow-sm">
-                <Upload className="w-3.5 h-3.5" />
-                <span>Upload File</span>
-                <input type="file" multiple onChange={handleFileUpload} className="hidden" />
-              </label>
-              <button
-                onClick={() => setShowNewFolderModal(true)}
-                className="flex items-center space-x-2 px-4 py-2 bg-white border border-slate-200 text-slate-700 hover:bg-slate-50 text-xs font-bold rounded-xl"
-              >
-                <FolderPlus className="w-3.5 h-3.5 text-indigo-600" />
-                <span>Create Sub-folder</span>
-              </button>
-            </div>
           </div>
         ) : (
-          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
             {filteredItems.map((item) => {
               const isFolder = item.asset_type === 'folder';
-              const isDM = item.scope === 'dm' || item.folder_path?.includes('/Direct Messages/');
-              const isPrivate = item.scope === 'private';
-              const isVirtual = item.id.startsWith('v_');
-
               return (
                 <div
                   key={item.id}
-                  className={`group relative bg-white border border-slate-200/80 rounded-2xl p-4 transition-all hover:shadow-md hover:border-slate-300 flex flex-col justify-between ${
-                    isFolder ? 'cursor-pointer hover:bg-indigo-50/20' : ''
-                  }`}
-                  onClick={() => {
-                    if (isFolder) handleOpenFolder(item.id);
-                    else setPreviewFile(item);
-                  }}
+                  onDoubleClick={() => isFolder ? handleOpenFolder(item.id) : handleOpenInVisualizer(item)}
+                  className="group relative bg-white border border-slate-200/80 hover:border-indigo-500/40 rounded-2xl p-4 shadow-sm hover:shadow-md transition-all flex flex-col justify-between cursor-pointer"
                 >
-                  {/* Top Header of Card */}
                   <div className="flex items-start justify-between mb-3">
-                    <div className="relative">
-                      {getFileIcon(item)}
-                      {isPrivate && (
-                        <span className="absolute -top-1 -right-1 p-0.5 bg-emerald-500 text-white rounded-full" title="Private to you">
-                          <Lock className="w-2.5 h-2.5" />
-                        </span>
-                      )}
-                      {isDM && (
-                        <span className="absolute -top-1 -right-1 p-0.5 bg-rose-500 text-white rounded-full" title="Direct Message (Limited)">
-                          <MessageSquare className="w-2.5 h-2.5" />
-                        </span>
-                      )}
+                    <div className="p-2.5 rounded-xl bg-slate-50 group-hover:bg-indigo-50/50 transition-colors">
+                      {getItemIcon(item)}
                     </div>
-
-                    {/* Action Menu (Rename, Delete, Copy Link) */}
-                    <div 
-                      className="opacity-0 group-hover:opacity-100 transition-opacity flex items-center space-x-1"
-                      onClick={(e) => e.stopPropagation()}
-                    >
-                      {!isFolder && item.url && (
-                        <button
-                          onClick={() => handleCopyLink(item.url)}
-                          className="p-1.5 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors"
-                          title="Copy Shareable Link"
-                        >
-                          {copiedLink === item.url ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <ExternalLink className="w-3.5 h-3.5" />}
-                        </button>
-                      )}
-
-                      {!isVirtual && (
-                        <>
-                          <button
-                            onClick={() => {
-                              setRenameTarget(item);
-                              setRenameValue(item.name);
-                            }}
-                            className="p-1.5 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-lg transition-colors"
-                            title="Rename"
-                          >
-                            <Edit2 className="w-3.5 h-3.5" />
-                          </button>
-                          <button
-                            onClick={() => handleDeleteItem(item)}
-                            className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors"
-                            title="Delete"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
-                        </>
-                      )}
-                    </div>
+                    
+                    {/* Visualizer Quick Action */}
+                    {!isFolder && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleOpenInVisualizer(item);
+                        }}
+                        className="px-2 py-1 rounded-lg bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-[10px] font-bold flex items-center space-x-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                        title="Open in Visualizer Tab"
+                      >
+                        <ExternalLink className="w-3 h-3" />
+                        <span>Visualize</span>
+                      </button>
+                    )}
                   </div>
 
-                  {/* Body Content */}
-                  <div className="min-w-0">
-                    <h4 className="text-xs font-bold text-slate-800 truncate mb-1" title={item.name}>
+                  <div>
+                    <h4 className="text-xs font-bold text-slate-900 truncate mb-1" title={item.name}>
                       {item.name}
                     </h4>
-
-                    <div className="flex items-center space-x-2 text-[10px] text-slate-400">
-                      {isFolder ? (
-                        <span>Folder</span>
-                      ) : (
-                        <>
-                          <span>{formatFileSize(item.size)}</span>
-                          <span>•</span>
-                          <span className="truncate">@{item.created_by}</span>
-                        </>
-                      )}
+                    <div className="flex items-center justify-between text-[10px] text-slate-400 font-mono">
+                      <span>{isFolder ? 'Folder' : item.size ? `${(item.size / 1024).toFixed(1)} KB` : 'System File'}</span>
+                      <span>{new Date(item.updated_at).toLocaleDateString()}</span>
                     </div>
                   </div>
 
-                  {/* Bottom Footer Tags */}
-                  <div className="mt-3 pt-2.5 border-t border-slate-100 flex items-center justify-between text-[10px]">
-                    <span className="text-slate-400 truncate">
-                      {new Date(item.updated_at).toLocaleDateString([], { month: 'short', day: 'numeric' })}
-                    </span>
-
-                    {isDM ? (
-                      <span className="px-2 py-0.5 bg-rose-50 text-rose-600 font-extrabold rounded-md text-[9px]">
-                        DM Limited
-                      </span>
-                    ) : isPrivate ? (
-                      <span className="px-2 py-0.5 bg-emerald-50 text-emerald-600 font-extrabold rounded-md text-[9px]">
-                        Private
-                      </span>
-                    ) : (
-                      <span className="px-2 py-0.5 bg-slate-100 text-slate-500 font-bold rounded-md text-[9px]">
-                        Shared
-                      </span>
-                    )}
+                  {/* Context Actions */}
+                  <div className="mt-3 pt-3 border-t border-slate-100 flex items-center justify-between text-[11px] text-slate-500">
+                    <span className="truncate max-w-[100px] text-[10px]">{item.created_by}</span>
+                    <div className="flex items-center space-x-1">
+                      {item.url && (
+                        <a
+                          href={item.url}
+                          download={item.name}
+                          onClick={(e) => e.stopPropagation()}
+                          className="p-1 hover:text-slate-900 rounded"
+                          title="Download"
+                        >
+                          <Download className="w-3 h-3" />
+                        </a>
+                      )}
+                      {!isFolder && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setPreviewFile(item);
+                          }}
+                          className="p-1 hover:text-slate-900 rounded"
+                          title="Inspect File"
+                        >
+                          <Eye className="w-3 h-3" />
+                        </button>
+                      )}
+                      {isAdmin && !item.id.startsWith('chat_file_') && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleDelete(item);
+                          }}
+                          className="p-1 hover:text-rose-600 rounded"
+                          title="Delete"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                        </button>
+                      )}
+                    </div>
                   </div>
                 </div>
               );
@@ -743,144 +817,88 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
         )}
       </div>
 
-      {/* Media Preview Modal */}
+      {/* File Preview Modal */}
       {previewFile && (
-        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-4 animate-fade-in">
-          <div className="bg-white w-full max-w-4xl max-h-[90vh] rounded-3xl shadow-2xl flex flex-col overflow-hidden border border-white/20 animate-scale-up">
-            
-            {/* Modal Header */}
-            <div className="px-6 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
-              <div className="flex items-center space-x-3 min-w-0">
-                <div className="p-2 bg-indigo-50 text-indigo-600 rounded-xl">
-                  {getFileIcon(previewFile)}
-                </div>
-                <div className="min-w-0">
-                  <h3 className="text-sm font-bold text-slate-900 truncate">{previewFile.name}</h3>
-                  <p className="text-xs text-slate-400">
-                    {formatFileSize(previewFile.size)} • Uploaded by @{previewFile.created_by} on {new Date(previewFile.updated_at).toLocaleDateString()}
-                  </p>
-                </div>
-              </div>
-
+        <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl w-full max-w-3xl max-h-[85vh] flex flex-col overflow-hidden shadow-2xl border border-slate-100">
+            <div className="p-4 bg-slate-900 text-white flex items-center justify-between">
               <div className="flex items-center space-x-2">
-                {previewFile.url && (
-                  <>
-                    <button
-                      onClick={() => handleCopyLink(previewFile.url)}
-                      className="flex items-center space-x-1.5 px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold rounded-xl transition-all"
-                    >
-                      {copiedLink === previewFile.url ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <ExternalLink className="w-3.5 h-3.5" />}
-                      <span>{copiedLink === previewFile.url ? 'Copied!' : 'Copy Link'}</span>
-                    </button>
-
-                    <a
-                      href={previewFile.url}
-                      download={previewFile.name}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="flex items-center space-x-1.5 px-3 py-1.5 bg-slate-950 text-white hover:bg-slate-800 text-xs font-bold rounded-xl shadow-sm transition-all"
-                    >
-                      <Download className="w-3.5 h-3.5" />
-                      <span>Download</span>
-                    </a>
-                  </>
-                )}
-
+                {getItemIcon(previewFile)}
+                <span className="font-bold text-xs font-mono">{previewFile.name}</span>
+              </div>
+              <div className="flex items-center space-x-2">
                 <button
-                  onClick={() => setPreviewFile(null)}
-                  className="p-2 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-xl transition-all"
+                  onClick={() => handleOpenInVisualizer(previewFile)}
+                  className="px-2.5 py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold flex items-center space-x-1"
                 >
-                  <X className="w-5 h-5" />
+                  <ExternalLink className="w-3 h-3" />
+                  <span>Open in Visualizer</span>
+                </button>
+                <button onClick={() => setPreviewFile(null)} className="p-1 text-slate-400 hover:text-white">
+                  <X className="w-4 h-4" />
                 </button>
               </div>
             </div>
 
-            {/* Modal Body / Viewer */}
-            <div className="flex-1 bg-slate-900/5 p-6 overflow-y-auto flex items-center justify-center min-h-[350px]">
-              {(() => {
-                const type = (previewFile.file_type || '').toLowerCase();
-                const ext = previewFile.name.split('.').pop()?.toLowerCase() || '';
-
-                // 1. Image Preview
-                if (type.startsWith('image/') || ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg'].includes(ext)) {
-                  return (
-                    <img
-                      src={previewFile.url}
-                      alt={previewFile.name}
-                      className="max-h-[65vh] max-w-full object-contain rounded-2xl shadow-lg border border-black/10"
-                    />
-                  );
-                }
-
-                // 2. Video Preview
-                if (type.startsWith('video/') || ['mp4', 'webm', 'mov', 'mkv'].includes(ext)) {
-                  return (
-                    <video
-                      controls
-                      autoPlay
-                      src={previewFile.url}
-                      className="max-h-[65vh] max-w-full rounded-2xl shadow-lg"
-                    >
-                      Your browser does not support the video tag.
-                    </video>
-                  );
-                }
-
-                // 3. Audio Preview
-                if (type.startsWith('audio/') || ['mp3', 'wav', 'ogg', 'm4a'].includes(ext)) {
-                  return (
-                    <div className="w-full max-w-md p-8 bg-white rounded-3xl shadow-lg border border-slate-100 flex flex-col items-center text-center">
-                      <div className="w-16 h-16 rounded-full bg-emerald-50 text-emerald-600 flex items-center justify-center mb-4">
-                        <Music className="w-8 h-8" />
-                      </div>
-                      <h4 className="text-sm font-bold text-slate-900 mb-4">{previewFile.name}</h4>
-                      <audio controls autoPlay src={previewFile.url} className="w-full">
-                        Your browser does not support the audio tag.
-                      </audio>
-                    </div>
-                  );
-                }
-
-                // 4. PDF Preview
-                if (type.includes('pdf') || ext === 'pdf') {
-                  return (
-                    <iframe
-                      src={previewFile.url}
-                      title={previewFile.name}
-                      className="w-full h-[65vh] rounded-2xl border border-slate-200 bg-white shadow-sm"
-                    />
-                  );
-                }
-
-                // 5. Code / Text File Preview
-                if (['json', 'js', 'ts', 'jsx', 'tsx', 'html', 'css', 'rs', 'py', 'txt', 'md', 'csv'].includes(ext)) {
-                  return (
-                    <div className="w-full max-w-3xl h-[60vh] bg-slate-950 text-slate-200 p-6 rounded-2xl font-mono text-xs overflow-auto">
-                      <pre>{previewFile.content || 'Binary data or streaming content from Cloudflare edge.'}</pre>
-                    </div>
-                  );
-                }
-
-                // 6. Generic Fallback
-                return (
-                  <div className="p-8 text-center bg-white rounded-3xl border border-slate-200 shadow-sm max-w-md">
-                    <File className="w-12 h-12 text-slate-400 mx-auto mb-3" />
-                    <h4 className="text-sm font-bold text-slate-800 mb-1">{previewFile.name}</h4>
-                    <p className="text-xs text-slate-400 mb-4">
-                      Preview not supported inline for this file type. Download to inspect locally.
-                    </p>
-                    <a
-                      href={previewFile.url}
-                      download={previewFile.name}
-                      className="inline-flex items-center space-x-2 px-4 py-2 bg-slate-900 text-white rounded-xl text-xs font-bold"
-                    >
-                      <Download className="w-3.5 h-3.5" />
-                      <span>Download File</span>
-                    </a>
-                  </div>
-                );
-              })()}
+            <div className="flex-1 p-6 overflow-auto bg-slate-950 text-slate-200 font-mono text-xs">
+              <pre className="whitespace-pre-wrap break-words leading-relaxed">
+                {previewFile.content || 'Binary data or streaming asset stored in Cloudflare storage tier.'}
+              </pre>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* New Code / Script File Modal */}
+      {showNewFileModal && (
+        <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl p-6 w-full max-w-lg shadow-2xl border border-slate-100">
+            <h3 className="text-base font-black text-slate-900 mb-1">Create New Code / Data File</h3>
+            <p className="text-xs text-slate-500 mb-4">
+              Write scripts, configurations, or data files in the company&apos;s Linux filesystem.
+            </p>
+
+            <form onSubmit={handleCreateFile} className="space-y-4">
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1.5">File Name</label>
+                <input
+                  type="text"
+                  required
+                  placeholder="e.g. script.py, data.csv, budget.sheet.json, notes.md"
+                  value={newFileName}
+                  onChange={(e) => setNewFileName(e.target.value)}
+                  className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+                  autoFocus
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1.5">Content</label>
+                <textarea
+                  rows={8}
+                  placeholder="# Enter Python script, CSV records, JSON, or text..."
+                  value={newFileContent}
+                  onChange={(e) => setNewFileContent(e.target.value)}
+                  className="w-full p-3 bg-slate-950 text-emerald-300 font-mono text-xs rounded-xl focus:outline-none"
+                />
+              </div>
+
+              <div className="flex items-center justify-end space-x-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setShowNewFileModal(false)}
+                  className="px-4 py-2 text-xs font-bold text-slate-600 hover:bg-slate-100 rounded-xl"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold rounded-xl shadow-md"
+                >
+                  Save & Mount File
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}
@@ -890,72 +908,30 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
         <div className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="bg-white rounded-3xl p-6 w-full max-w-md shadow-2xl border border-slate-100">
             <h3 className="text-base font-black text-slate-900 mb-1">Create New Folder</h3>
-            <p className="text-xs text-slate-500 mb-4">
-              Organize assets inside this folder. Choose whether it is shared or private.
-            </p>
-
             <form onSubmit={handleCreateFolder} className="space-y-4">
               <div>
                 <label className="block text-xs font-bold text-slate-700 mb-1.5">Folder Name</label>
                 <input
                   type="text"
                   required
-                  placeholder="e.g. Design Assets, Q3 Invoices, Sprint Recordings"
+                  placeholder="e.g. analytics, scripts, q4_reports"
                   value={newFolderName}
                   onChange={(e) => setNewFolderName(e.target.value)}
-                  className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 focus:outline-none"
+                  className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:outline-none"
                   autoFocus
                 />
               </div>
-
-              <div>
-                <label className="block text-xs font-bold text-slate-700 mb-1.5">Privacy Scope</label>
-                <div className="grid grid-cols-2 gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setNewFolderScope('shared')}
-                    className={`p-3 rounded-xl border text-left flex flex-col transition-all ${
-                      newFolderScope === 'shared' 
-                        ? 'border-indigo-600 bg-indigo-50/50 text-indigo-900' 
-                        : 'border-slate-200 hover:bg-slate-50 text-slate-700'
-                    }`}
-                  >
-                    <div className="flex items-center space-x-1.5 font-bold text-xs mb-1">
-                      <Globe className="w-3.5 h-3.5 text-indigo-600" />
-                      <span>Company Shared</span>
-                    </div>
-                    <span className="text-[10px] text-slate-500">Accessible by all members</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => setNewFolderScope('private')}
-                    className={`p-3 rounded-xl border text-left flex flex-col transition-all ${
-                      newFolderScope === 'private' 
-                        ? 'border-emerald-600 bg-emerald-50/50 text-emerald-900' 
-                        : 'border-slate-200 hover:bg-slate-50 text-slate-700'
-                    }`}
-                  >
-                    <div className="flex items-center space-x-1.5 font-bold text-xs mb-1">
-                      <Lock className="w-3.5 h-3.5 text-emerald-600" />
-                      <span>My Private</span>
-                    </div>
-                    <span className="text-[10px] text-slate-500">Only visible to you & admin</span>
-                  </button>
-                </div>
-              </div>
-
               <div className="flex items-center justify-end space-x-2 pt-2">
                 <button
                   type="button"
                   onClick={() => setShowNewFolderModal(false)}
-                  className="px-4 py-2 text-xs font-bold text-slate-500 hover:text-slate-800"
+                  className="px-4 py-2 text-xs font-bold text-slate-600 hover:bg-slate-100 rounded-xl"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2 bg-slate-950 text-white rounded-xl text-xs font-bold hover:bg-slate-800 shadow-sm"
+                  className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold rounded-xl shadow-md"
                 >
                   Create Folder
                 </button>
@@ -965,41 +941,7 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
         </div>
       )}
 
-      {/* Rename Modal */}
-      {renameTarget && (
-        <div className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-white rounded-3xl p-6 w-full max-w-sm shadow-2xl border border-slate-100">
-            <h3 className="text-base font-black text-slate-900 mb-1">Rename {renameTarget.asset_type}</h3>
-            <form onSubmit={handleRenameSubmit} className="space-y-4 mt-3">
-              <input
-                type="text"
-                required
-                value={renameValue}
-                onChange={(e) => setRenameValue(e.target.value)}
-                className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 focus:outline-none"
-                autoFocus
-              />
-              <div className="flex items-center justify-end space-x-2">
-                <button
-                  type="button"
-                  onClick={() => setRenameTarget(null)}
-                  className="px-4 py-2 text-xs font-bold text-slate-500 hover:text-slate-800"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  className="px-4 py-2 bg-slate-950 text-white rounded-xl text-xs font-bold hover:bg-slate-800"
-                >
-                  Save Changes
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
-
-      {/* Delete Confirmation Modal */}
+      {/* Confirm Action Modal */}
       {confirmConfig && (
         <ConfirmModal
           isOpen={confirmConfig.isOpen}

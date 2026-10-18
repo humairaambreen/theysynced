@@ -59,10 +59,25 @@ Best of all, the entire platform is engineered to run on **Cloudflare's 100% Fre
 - Workspace owners and administrators can export a full, decrypted JSON archive of all organizational assets, chats, and metadata at any time.
 - Accompanied by a cryptographic **SHA-256 integrity checksum** for auditable compliance and zero vendor lock-in.
 
+### 🐧 Isolated Linux Work OS & WebAssembly Terminal
+- Every company receives its own dedicated, isolated Linux operating system environment (`/workspace`).
+- Built-in **Python 3.12 WebAssembly runtime (Pyodide)** with full standard library (`os`, `sys`, `csv`, `json`, `tarfile`, `zipfile`, `re`, `shutil`).
+- Real package management: install real Python packages right in the browser sandbox (`pip install <pkg>`).
+- Authentic in-terminal **GNU nano 7.2 editor** (`nano <file>`) to write, edit, and modify scripts on the fly.
+- Real POSIX core utilities without hardcoded commands: `ls`, `cd`, `pwd`, `cat`, `head`, `tail`, `grep`, `find`, `mkdir`, `touch`, `rm`, `cp`, `mv`, `echo`, `wc`, `tree`, `tar`, `zip`, `export`, and pipes (`|`).
+- Real-time team synchronized terminal session over WebSockets.
+
+### 📁 Graphical Linux File System (Nautilus) & Visualizer Interoperability
+- The **File System (GUI)** is the graphical desktop explorer for the company's Linux filesystem.
+- Organized folders: `/workspace/chats/` (chat logs), `/workspace/spreadsheets/` (sheets & CSVs), `/workspace/drawings/` (Excalidraw canvases), `/workspace/docs/` (markdown docs), `/workspace/files/` (media), and `/workspace/export/` (backups).
+- **Direct Visualizer Interoperability**: Click any `.sheet.json` to open in the Spreadsheet tab, `.excalidraw.json` to open in Excalidraw, `.doc.json` in Docs, or `.chat.json` in Chat!
+- Seamless bidirectional sync: modifying a file in the terminal updates the visualizer, and editing in the visualizer updates the Linux filesystem.
+- One-click **"Export Org Backup"** generates a full encrypted tarball and zip dump of all organization assets.
+
 ### 🧹 Automated 90-Day Inactivity Retention & Hard Purge
 - Workspaces inactive for 90 days (3 months) are automatically and permanently purged by a background **Cloudflare Cron Trigger** (`0 * * * *`).
-- Active workspaces stay fresh with automatic heartbeat touches.
-- Admins can trigger an immediate, irreversible hard purge to eradicate all traces of an organization in one click.
+- Eradicates all database records in D1 AND permanently deletes all media, files, and assets from Cloudflare KV / R2 storage.
+- Admins can trigger an immediate hard purge to wipe an organization and its media in one click.
 
 ---
 
