@@ -7,7 +7,7 @@ import {
   ExternalLink, Eye, ChevronRight, FileText, Image, Video, Music, 
   FileCode, File, Globe, Lock, Check, X, ShieldAlert, Sparkles, 
   ArrowLeft, HardDrive, RefreshCw, MessageSquare, Terminal, Table, 
-  PenTool, Code, CheckCircle
+  PenTool, Code, CheckCircle, CheckSquare
 } from 'lucide-react';
 import { ConfirmModal } from './ConfirmModal';
 import { buildCompanyLinuxFilesystem } from '../lib/linuxFilesystem';
@@ -138,6 +138,7 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
     if (currentFolderId === 'v_linux_drawings') return '/workspace/drawings';
     if (currentFolderId === 'v_linux_docs') return '/workspace/docs';
     if (currentFolderId === 'v_linux_files') return '/workspace/files';
+    if (currentFolderId === 'v_linux_tasks') return '/workspace/tasks';
     if (currentFolderId === 'v_linux_export') return '/workspace/export';
     const f = accessibleAssets.find((a) => a.id === currentFolderId);
     return f ? `/workspace/${f.name}` : '/workspace';
@@ -210,6 +211,16 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
           created_by: 'Linux Kernel',
           updated_at: new Date().toISOString(),
           folder_path: '/workspace/files',
+          scope: 'shared',
+        },
+        {
+          id: 'v_linux_tasks',
+          company_id: company.id,
+          asset_type: 'folder',
+          name: 'tasks',
+          created_by: 'Linux Kernel',
+          updated_at: new Date().toISOString(),
+          folder_path: '/workspace/tasks',
           scope: 'shared',
         },
         {
@@ -299,6 +310,24 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
         }));
     }
 
+    // Inside /workspace/tasks
+    if (currentFolderId === 'v_linux_tasks') {
+      return linuxEntries
+        .filter((e) => e.folder === '/workspace/tasks')
+        .map((e): WorkspaceAsset => ({
+          id: `tasks_file_${e.name}`,
+          company_id: company.id,
+          asset_type: 'file',
+          name: e.name,
+          folder_path: '/workspace/tasks',
+          content: e.content,
+          size: e.size,
+          created_by: e.created_by,
+          updated_at: e.updated_at,
+          scope: 'shared',
+        }));
+    }
+
     // Inside /workspace/export
     if (currentFolderId === 'v_linux_export') {
       return accessibleAssets.filter((a) => a.folder_path === '/workspace/export' || a.name.includes('backup'));
@@ -368,6 +397,8 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
       onNavigateTab('whiteboard', item.id);
     } else if (name.endsWith('.doc.json') || name.endsWith('.md') || item.asset_type === 'doc') {
       onNavigateTab('docs', item.id);
+    } else if (name.includes('task') || name.includes('kanban') || item.folder_path?.includes('tasks')) {
+      onNavigateTab('tasks', item.id);
     } else if (name.endsWith('.chat.json') || name.endsWith('.log') || item.folder_path?.includes('chats')) {
       // Find channel id
       const chan = teams.find((t) => t.name.toLowerCase() === name.replace(/\.(log|chat\.json)$/, '').replace(/^dm-/, 'dm:'));
@@ -552,6 +583,9 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
     }
     if (name.endsWith('.doc.json') || name.endsWith('.md') || item.asset_type === 'doc') {
       return <FileText className="w-5 h-5 text-blue-600 shrink-0" />;
+    }
+    if (name.includes('task') || name.includes('kanban') || item.folder_path?.includes('tasks')) {
+      return <CheckSquare className="w-5 h-5 text-emerald-600 shrink-0" />;
     }
     if (name.endsWith('.chat.json') || name.endsWith('.log') || item.folder_path?.includes('chats')) {
       return <MessageSquare className="w-5 h-5 text-cyan-600 shrink-0" />;

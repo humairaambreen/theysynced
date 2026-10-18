@@ -20,6 +20,8 @@ import { getAllOfflineAssets } from './lib/offlineStore';
 import { InviteModal } from './components/InviteModal';
 import { RdpView } from './components/RdpView';
 import { SharedTerminalView } from './components/SharedTerminalView';
+import { TasksKanbanView } from './components/TasksKanbanView';
+import { BrowserView } from './components/BrowserView';
 
 
 
@@ -50,6 +52,7 @@ export default function App() {
   const [assets, setAssets] = useState<WorkspaceAsset[]>([]);
   const [activeTeamId, setActiveTeamId] = useState<string | undefined>(undefined);
   const [terminalInitialPath, setTerminalInitialPath] = useState<string>('/workspace');
+  const [browserInitialUrl, setBrowserInitialUrl] = useState<string>('http://localhost:3000');
 
   const [screenSeconds, setScreenSeconds] = useState(0);
   const currentChannelIdRef = useRef<string | undefined>(undefined);
@@ -75,6 +78,10 @@ export default function App() {
       } else {
         path = '/chat/general';
       }
+    } else if (tab === 'tasks') {
+      path = '/tasks';
+    } else if (tab === 'browser') {
+      path = '/browser';
     } else if (tab === 'assets') {
       path = '/assets';
     } else if (tab === 'terminal') {
@@ -106,6 +113,13 @@ export default function App() {
       if (subItem) setTerminalInitialPath(subItem);
       setActiveTab('terminal');
       syncUrl('terminal');
+    } else if (tab === 'tasks') {
+      setActiveTab('tasks');
+      syncUrl('tasks');
+    } else if (tab === 'browser') {
+      if (subItem) setBrowserInitialUrl(subItem);
+      setActiveTab('browser');
+      syncUrl('browser');
     } else if (tab === 'assets') {
       setActiveTab('assets');
       syncUrl('assets');
@@ -143,6 +157,10 @@ export default function App() {
           setActiveTeamId(found.id);
         }
       }
+    } else if (section === 'tasks' || section === 'jira' || section === 'kanban') {
+      setActiveTab('tasks');
+    } else if (section === 'browser' || section === 'web') {
+      setActiveTab('browser');
     } else if (section === 'assets' || section === 'storage' || section === 'files') {
       setActiveTab('assets');
     } else if (section === 'terminal' || section === 'linux' || section === 'shell') {
@@ -1007,6 +1025,27 @@ export default function App() {
               onDeleteAsset={handleDeleteAsset}
               onNavigateTab={handleNavigateTab}
               initialPath={terminalInitialPath}
+            />
+          )}
+
+          {activeTab === 'tasks' && activeCompany && user && (
+            <TasksKanbanView
+              user={user}
+              company={activeCompany}
+              assets={assets}
+              websocket={websocket}
+              onSaveAsset={handleSaveAsset}
+              onDeleteAsset={handleDeleteAsset}
+              onNavigateTab={handleNavigateTab}
+            />
+          )}
+
+          {activeTab === 'browser' && activeCompany && user && (
+            <BrowserView
+              user={user}
+              company={activeCompany}
+              initialUrl={browserInitialUrl}
+              onNavigateTab={handleNavigateTab}
             />
           )}
 

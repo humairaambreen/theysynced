@@ -113,6 +113,24 @@ export interface CallParticipant {
   joined_at: string;
 }
 
-export type ActiveTab = 'overview' | 'teams' | 'assets' | 'terminal' | 'rdp' | 'whiteboard' | 'spreadsheet' | 'docs' | 'activity';
+export type TaskPriority = 'urgent' | 'high' | 'medium' | 'low';
+export type TaskStatus = 'backlog' | 'todo' | 'in_progress' | 'review' | 'done';
+
+export interface TaskItem {
+  id: string;
+  company_id: string;
+  title: string;
+  description: string;
+  status: TaskStatus;
+  priority: TaskPriority;
+  assignee: string;
+  creator: string;
+  created_at: string;
+  updated_at: string;
+  due_date?: string;
+  tags?: string[];
+}
+
+export type ActiveTab = 'overview' | 'teams' | 'assets' | 'terminal' | 'tasks' | 'browser' | 'rdp' | 'whiteboard' | 'spreadsheet' | 'docs' | 'activity';
 
 

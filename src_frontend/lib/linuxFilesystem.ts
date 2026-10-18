@@ -5,14 +5,14 @@ export interface LinuxFileEntry {
   name: string;           // e.g. general.log
   folder: string;         // e.g. /workspace/chats
   type: 'file' | 'folder';
-  category: 'chat' | 'spreadsheet' | 'drawing' | 'doc' | 'file' | 'export' | 'system' | 'home';
+  category: 'chat' | 'spreadsheet' | 'drawing' | 'doc' | 'file' | 'export' | 'system' | 'home' | 'tasks';
   content?: string;
   size?: number;
   url?: string;
   updated_at: string;
   created_by: string;
   asset_id?: string;
-  target_tab?: 'teams' | 'spreadsheet' | 'whiteboard' | 'docs' | 'assets';
+  target_tab?: 'teams' | 'spreadsheet' | 'whiteboard' | 'docs' | 'assets' | 'tasks' | 'browser';
   target_id?: string;
   scope?: 'shared' | 'private' | 'dm';
   allowed_users?: string[];
@@ -112,7 +112,7 @@ export function buildCompanyLinuxFilesystem(
   const currentUsernameLower = user.username.toLowerCase();
 
   // 1. Root & Workspace Directories
-  const rootFolders = ['chats', 'spreadsheets', 'drawings', 'docs', 'files', 'export'];
+  const rootFolders = ['chats', 'spreadsheets', 'drawings', 'docs', 'files', 'tasks', 'export'];
   rootFolders.forEach((rf) => {
     entries.push({
       path: `/workspace/${rf}`,
@@ -500,6 +500,137 @@ export function buildCompanyLinuxFilesystem(
       target_tab: 'assets',
       target_id: sf.id,
     });
+  });
+
+  // 6.5 TASKS -> /workspace/tasks/tasks.json, KANBAN.md, TASKS.csv
+  const taskAsset = assets.find((a) => a.id === `tasks_${company.id}` || a.name === 'tasks.json');
+  let taskList: any[] = [];
+  if (taskAsset && taskAsset.content) {
+    try {
+      const parsed = JSON.parse(taskAsset.content);
+      if (Array.isArray(parsed)) taskList = parsed;
+    } catch (_) {}
+  }
+  if (taskList.length === 0) {
+    taskList = [
+      {
+        id: 'TS-101',
+        title: 'Architect Cloudflare D1 & KV edge storage integration',
+        description: 'Zero-server edge persistence with 100% free tier compliance and hourly TTL retention.',
+        status: 'done',
+        priority: 'urgent',
+        assignee: user.username,
+        creator: user.username,
+        created_at: now,
+        updated_at: now,
+        tags: ['Backend', 'Cloudflare', 'Security'],
+      },
+      {
+        id: 'TS-102',
+        title: 'Build Pyodide WebAssembly POSIX Linux execution sandbox',
+        description: 'Full CPython 3.12 with standard libraries, pip micropip installer, and real POSIX file ops.',
+        status: 'done',
+        priority: 'high',
+        assignee: user.username,
+        creator: user.username,
+        created_at: now,
+        updated_at: now,
+        tags: ['Linux', 'WebAssembly', 'Python'],
+      },
+      {
+        id: 'TS-103',
+        title: 'Enforce private DM permissions & POSIX ACL user boundaries',
+        description: 'Ensure personal DMs and user home folders (/home/<user>) cannot be read by unauthorized users.',
+        status: 'done',
+        priority: 'urgent',
+        assignee: user.username,
+        creator: user.username,
+        created_at: now,
+        updated_at: now,
+        tags: ['Security', 'ACL', 'Permissions'],
+      },
+      {
+        id: 'TS-104',
+        title: 'Implement shared Jira-style Task Board & Localhost Web Browser',
+        description: 'Create Jira Kanban board synced to /workspace/tasks and in-system browser tab for localhost and web preview.',
+        status: 'in_progress',
+        priority: 'high',
+        assignee: user.username,
+        creator: user.username,
+        created_at: now,
+        updated_at: now,
+        tags: ['Frontend', 'Kanban', 'Browser'],
+      },
+    ];
+  }
+
+  const tasksJson = JSON.stringify(taskList, null, 2);
+  let kanbanMd = `# ${company.name} Jira Task Board\nLast Updated: ${now}\n\n`;
+  const taskStatuses = ['backlog', 'todo', 'in_progress', 'review', 'done'];
+  taskStatuses.forEach((st) => {
+    const items = taskList.filter((t) => t.status === st);
+    kanbanMd += `## ${st.toUpperCase().replace('_', ' ')} (${items.length})\n`;
+    if (items.length === 0) {
+      kanbanMd += `*(Empty)*\n\n`;
+    } else {
+      items.forEach((t) => {
+        kanbanMd += `- [${t.status === 'done' ? 'x' : ' '}] **[${t.id}] ${t.title}** (Priority: ${t.priority || 'medium'}, Assignee: @${t.assignee || 'unassigned'})\n`;
+        if (t.description) kanbanMd += `  > ${t.description}\n`;
+      });
+      kanbanMd += '\n';
+    }
+  });
+
+  const tasksCsv = 'ID,Title,Status,Priority,Assignee,Creator,Updated\n' + taskList.map((t) => 
+    `"${t.id}","${(t.title || '').replace(/"/g, '""')}","${t.status}","${t.priority}","${t.assignee || ''}","${t.creator || ''}","${t.updated_at || ''}"`
+  ).join('\n');
+
+  entries.push({
+    path: '/workspace/tasks/tasks.json',
+    name: 'tasks.json',
+    folder: '/workspace/tasks',
+    type: 'file',
+    category: 'tasks',
+    content: tasksJson,
+    size: tasksJson.length,
+    updated_at: now,
+    created_by: 'system',
+    scope: 'shared',
+    mode: '-rw-r--r--',
+    target_tab: 'tasks',
+    target_id: `tasks_${company.id}`,
+  });
+
+  entries.push({
+    path: '/workspace/tasks/KANBAN.md',
+    name: 'KANBAN.md',
+    folder: '/workspace/tasks',
+    type: 'file',
+    category: 'tasks',
+    content: kanbanMd,
+    size: kanbanMd.length,
+    updated_at: now,
+    created_by: 'system',
+    scope: 'shared',
+    mode: '-rw-r--r--',
+    target_tab: 'tasks',
+    target_id: `tasks_${company.id}`,
+  });
+
+  entries.push({
+    path: '/workspace/tasks/TASKS.csv',
+    name: 'TASKS.csv',
+    folder: '/workspace/tasks',
+    type: 'file',
+    category: 'tasks',
+    content: tasksCsv,
+    size: tasksCsv.length,
+    updated_at: now,
+    created_by: 'system',
+    scope: 'shared',
+    mode: '-rw-r--r--',
+    target_tab: 'tasks',
+    target_id: `tasks_${company.id}`,
   });
 
   // 7. SYSTEM METADATA -> /etc/theysynced/

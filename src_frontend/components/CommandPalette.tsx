@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState, useEffect, useMemo } from 'react';
-import { Search, Hash, FileText, Table, MessageSquare, User, X, ArrowRight, PenTool, Monitor } from 'lucide-react';
+import { Search, Hash, FileText, Table, MessageSquare, User, X, ArrowRight, PenTool, Monitor, CheckSquare, FolderGit2, Terminal, Globe } from 'lucide-react';
 
 import Fuse from 'fuse.js';
 import { Company, Team, CompanyMember, WorkspaceAsset, ChatMessage } from '../types';
@@ -66,10 +66,14 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
     items.push(
       { id: 'tab-overview', type: 'tab', label: 'Office Perks & Company Info', category: 'Workspace navigation', tab: 'overview', icon: Hash },
       { id: 'tab-teams', type: 'tab', label: 'Teams & Channels Hub', category: 'Workspace navigation', tab: 'teams', icon: MessageSquare },
+      { id: 'tab-tasks', type: 'tab', label: 'Jira Tasks Kanban Board', category: 'Workspace navigation', tab: 'tasks', icon: CheckSquare },
+      { id: 'tab-assets', type: 'tab', label: 'Linux File System (GUI)', category: 'Workspace navigation', tab: 'assets', icon: FolderGit2 },
+      { id: 'tab-terminal', type: 'tab', label: 'Linux Shell Terminal', category: 'Workspace navigation', tab: 'terminal', icon: Terminal },
+      { id: 'tab-browser', type: 'tab', label: 'Web Browser & Localhost Dev Inspector', category: 'Workspace navigation', tab: 'browser', icon: Globe },
       { id: 'tab-rdp', type: 'tab', label: 'Remote Desktop (RDP)', category: 'Workspace navigation', tab: 'rdp', icon: Monitor },
       { id: 'tab-whiteboard', type: 'tab', label: 'Excalidraw Vector Board', category: 'Workspace navigation', tab: 'whiteboard', icon: PenTool },
       { id: 'tab-spreadsheet', type: 'tab', label: 'Statistical spreadsheet Grid', category: 'Workspace navigation', tab: 'spreadsheet', icon: Table },
-      { id: 'tab-docs', type: 'tab', label: 'TipTap Docs & PDF Suite', category: 'Workspace navigation', tab: 'docs', icon: FileText },
+      { id: 'tab-docs', type: 'tab', label: 'TipTap Docs & Knowledge Base', category: 'Workspace navigation', tab: 'docs', icon: FileText },
       { id: 'tab-activity', type: 'tab', label: 'Activity Hub & Governance', category: 'Workspace navigation', tab: 'activity', icon: Hash }
     );
 

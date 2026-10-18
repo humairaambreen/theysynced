@@ -202,6 +202,7 @@ Type "help" for command manual, "open <file>" to visualize, or "gui" to open Nau
         '/workspace/drawings',
         '/workspace/docs',
         '/workspace/files',
+        '/workspace/tasks',
         '/workspace/export',
         '/etc',
         '/etc/theysynced',
@@ -759,10 +760,11 @@ def posix_shell_single(cmd_str, cwd, username, hostname, stdin_data="", is_admin
             tar.add('/workspace/drawings', arcname='drawings')
             tar.add('/workspace/docs', arcname='docs')
             tar.add('/workspace/files', arcname='files')
+            tar.add('/workspace/tasks', arcname='tasks')
             tar.add('/etc/theysynced', arcname='system_config')
 
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for root_folder in ['/workspace/chats', '/workspace/spreadsheets', '/workspace/drawings', '/workspace/docs', '/workspace/files', '/etc/theysynced']:
+            for root_folder in ['/workspace/chats', '/workspace/spreadsheets', '/workspace/drawings', '/workspace/docs', '/workspace/files', '/workspace/tasks', '/etc/theysynced']:
                 for r, _, fls in os.walk(root_folder):
                     for f in fls:
                         full_p = os.path.join(r, f)
@@ -783,6 +785,7 @@ Included Workspaces:
   📁 /workspace/drawings/     (Excalidraw system architecture diagrams)
   📁 /workspace/docs/         (Knowledgebase documents & markdown)
   📁 /workspace/files/        (Storage assets & media)
+  📁 /workspace/tasks/        (Jira tasks, backlog, and Kanban board)
   📁 /etc/theysynced/         (Roster, permissions, & encryption keys)
 
 Files are saved into /workspace/export/ and ready for immediate download.
@@ -794,6 +797,11 @@ Files are saved into /workspace/export/ and ready for immediate download.
         if not args:
             return {"output": "Opening GUI File Manager...", "error": "", "new_cwd": cwd, "open_tab": "assets", "open_id": cwd}
         target_file = args[0]
+
+        # Web URL check
+        if target_file.startswith('http://') or target_file.startswith('https://') or target_file.startswith('localhost'):
+            return {"output": f"Opening '{target_file}' in Web Browser tab...", "error": "", "new_cwd": cwd, "open_tab": "browser", "open_id": target_file}
+
         # Resolve target
         clean_target = os.path.abspath(target_file) if not target_file.startswith('/') else target_file
         basename = os.path.basename(clean_target)
@@ -804,12 +812,91 @@ Files are saved into /workspace/export/ and ready for immediate download.
             return {"output": f"Opening '{basename}' in Excalidraw Canvas...", "error": "", "new_cwd": cwd, "open_tab": "whiteboard", "open_id": basename}
         elif 'doc' in basename or basename.endswith('.md'):
             return {"output": f"Opening '{basename}' in Docs Tab...", "error": "", "new_cwd": cwd, "open_tab": "docs", "open_id": basename}
+        elif 'task' in basename or 'kanban' in basename.lower() or clean_target.startswith('/workspace/tasks'):
+            return {"output": f"Opening Jira Tasks Board in Kanban View...", "error": "", "new_cwd": cwd, "open_tab": "tasks", "open_id": basename}
         elif 'chat' in basename or clean_target.startswith('/workspace/chats'):
             return {"output": f"Opening '{basename}' in Teams & Chat Tab...", "error": "", "new_cwd": cwd, "open_tab": "teams", "open_id": basename}
         elif os.path.isdir(clean_target):
             return {"output": f"Opening GUI File Manager at '{clean_target}'...", "error": "", "new_cwd": clean_target, "open_tab": "assets", "open_id": clean_target}
         else:
             return {"output": f"Opening '{basename}' in GUI File Manager...", "error": "", "new_cwd": cwd, "open_tab": "assets", "open_id": basename}
+
+    # 17.5 TASK / JIRA CLI
+    if cmd in ['task', 'tasks', 'jira']:
+        subcmd = args[0].lower() if args else 'list'
+        tasks_file = '/workspace/tasks/tasks.json'
+        tasks_data = []
+        if os.path.exists(tasks_file):
+            try:
+                with open(tasks_file, 'r') as f:
+                    tasks_data = json.load(f)
+            except Exception:
+                tasks_data = []
+
+        if subcmd in ['list', 'ls']:
+            if not tasks_data:
+                return {"output": "No tasks found. Create one with: task add \"Task title\"", "error": "", "new_cwd": cwd}
+            out_lines = [f"{'ID':<8} {'STATUS':<14} {'PRIORITY':<10} {'ASSIGNEE':<16} {'TITLE'}"]
+            out_lines.append("-" * 75)
+            for t in tasks_data:
+                tid = t.get('id', 'TS-?')
+                st = t.get('status', 'todo').upper()
+                pri = t.get('priority', 'medium').upper()
+                assignee = f"@{t.get('assignee', 'unassigned')}"
+                title = t.get('title', '')
+                out_lines.append(f"{tid:<8} {st:<14} {pri:<10} {assignee:<16} {title}")
+            return {"output": "\\n".join(out_lines), "error": "", "new_cwd": cwd}
+
+        elif subcmd in ['add', 'create', 'new']:
+            task_title = " ".join(args[1:]) if len(args) > 1 else ""
+            if not task_title:
+                return {"output": "", "error": "Usage: task add <title>", "new_cwd": cwd}
+            new_id = f"TS-{len(tasks_data) + 101}"
+            now_iso = datetime.datetime.now().isoformat()
+            new_task = {
+                "id": new_id,
+                "title": task_title,
+                "description": "",
+                "status": "todo",
+                "priority": "medium",
+                "assignee": username,
+                "creator": username,
+                "created_at": now_iso,
+                "updated_at": now_iso,
+                "tags": ["CLI", "Linux"]
+            }
+            tasks_data.append(new_task)
+            os.makedirs('/workspace/tasks', exist_ok=True)
+            with open(tasks_file, 'w') as f:
+                json.dump(tasks_data, f, indent=2)
+            return {"output": f"✅ Created Task [{new_id}]: {task_title}", "error": "", "new_cwd": cwd}
+
+        elif subcmd in ['done', 'complete', 'finish']:
+            if len(args) < 2:
+                return {"output": "", "error": "Usage: task done <ID>", "new_cwd": cwd}
+            target_id = args[1].upper()
+            found = False
+            for t in tasks_data:
+                if t.get('id', '').upper() == target_id:
+                    t['status'] = 'done'
+                    t['updated_at'] = datetime.datetime.now().isoformat()
+                    found = True
+                    break
+            if not found:
+                return {"output": "", "error": f"Task '{target_id}' not found.", "new_cwd": cwd}
+            with open(tasks_file, 'w') as f:
+                json.dump(tasks_data, f, indent=2)
+            return {"output": f"✅ Marked Task [{target_id}] as DONE.", "error": "", "new_cwd": cwd}
+
+        elif subcmd in ['open', 'gui', 'board']:
+            return {"output": "Opening Jira Tasks Kanban Board...", "error": "", "new_cwd": cwd, "open_tab": "tasks", "open_id": "board"}
+        else:
+            return {"output": "Usage: task [list|add \"<title>\"|done <id>|open]", "error": "", "new_cwd": cwd}
+
+    # 17.6 BROWSER / CURL-WEB CLI
+    if cmd in ['browser', 'browse', 'curl-web', 'surf']:
+        target_url = args[0] if args else 'http://localhost:3000'
+        return {"output": f"Opening '{target_url}' in Web Browser tab...", "error": "", "new_cwd": cwd, "open_tab": "browser", "open_id": target_url}
 
     # 18. SYSTEM METRICS: uname, hostname, date, uptime, df, free, whoami, who, id
     if cmd == 'uname':
@@ -1044,7 +1131,11 @@ Unified Operating System Commands:
                        - .excalidraw.json    -> Excalidraw Canvas Tab
                        - .doc.json / .md     -> Docs Tab
                        - .chat.json / .log   -> Teams & Chat Tab
+                       - tasks.json / KANBAN -> Jira Tasks Kanban Tab
+                       - URLs (http/https)   -> Web Browser Tab
                        - directories         -> Nautilus File System GUI
+    task [ls|add|done] Manage Jira tasks directly from shell
+    browser <url>      Open in-system Web Browser (preview & localhost dev inspector)
     gui                Switch directly to the graphical File Manager at current path
 
   Organization Data & Exports:
