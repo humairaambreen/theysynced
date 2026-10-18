@@ -1,16 +1,19 @@
 version: '3.8'
 
 services:
-  theysynced-backend:
+  theysynced-os:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: theysynced-backend
+    container_name: theysynced-os
     ports:
       - "8000:8000"
     environment:
       - PORT=8000
+      - HOST=0.0.0.0
       - RUST_LOG=info
+    volumes:
+      - workspace_data:/workspace
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
@@ -18,16 +21,7 @@ services:
       timeout: 5s
       retries: 3
 
-  theysynced-frontend:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: theysynced-frontend
-    command: ["npx", "next", "start", "-p", "3000"]
-    ports:
-      - "3000:3000"
-    environment:
-      - NODE_ENV=production
-    depends_on:
-      - theysynced-backend
-    restart: unless-stopped
+volumes:
+  workspace_data:
+    name: theysynced_workspace_data
+    driver: local

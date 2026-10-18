@@ -159,7 +159,10 @@ export const SharedTerminalView: React.FC<SharedTerminalViewProps> = ({
           wsHost = `${loc.hostname}:8000`;
         }
         const wsProto = loc.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${wsProto}//${wsHost}/ws/terminal`;
+        const cols = term?.cols || 100;
+        const rows = term?.rows || 30;
+        const uname = encodeURIComponent(user?.username || 'user');
+        const wsUrl = `${wsProto}//${wsHost}/ws/terminal?username=${uname}&cols=${cols}&rows=${rows}`;
 
         const ws = new WebSocket(wsUrl);
         ws.binaryType = 'arraybuffer';
@@ -288,6 +291,13 @@ export const SharedTerminalView: React.FC<SharedTerminalViewProps> = ({
         }
       });
 
+      // Synchronize terminal dimensions with native PTY master on dynamic resize
+      term.onResize(({ cols, rows }: { cols: number; rows: number }) => {
+        if (activeModeRef.current === 'pty' && ptyWsRef.current?.readyState === WebSocket.OPEN) {
+          ptyWsRef.current.send(JSON.stringify({ type: 'resize', cols, rows }));
+        }
+      });
+
       // Step 1: Try native Rust PTY WebSocket (0ms native processes, pacman, apt, fish)
       const ptyConnected = await tryConnectPty(term);
 
@@ -302,6 +312,13 @@ export const SharedTerminalView: React.FC<SharedTerminalViewProps> = ({
     const handleResize = () => {
       try {
         fitAddonRef.current?.fit();
+        if (activeModeRef.current === 'pty' && ptyWsRef.current?.readyState === WebSocket.OPEN && xtermInstance.current) {
+          ptyWsRef.current.send(JSON.stringify({
+            type: 'resize',
+            cols: xtermInstance.current.cols,
+            rows: xtermInstance.current.rows,
+          }));
+        }
       } catch (_) {}
     };
 

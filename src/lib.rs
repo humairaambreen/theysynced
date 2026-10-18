@@ -127,6 +127,7 @@ pub fn create_app(state: AppState) -> Router {
         .route("/ws/:session_id", get(websocket_handler))
         .route("/rdp-ws", get(rdp_websocket_handler))
         .route("/ws/terminal", get(terminal_pty_ws_handler))
+        .route("/api/browser/proxy", get(browser_proxy_handler))
 
         // Storage / Media API (Cloudflare R2 & Local fallback)
         .route("/api/storage/upload", post(upload_storage_handler))
@@ -1153,21 +1154,54 @@ async fn handle_rdp_websocket(client_socket: WebSocket) {
     }
 }
 
+#[derive(Deserialize, Default)]
+struct TerminalQuery {
+    username: Option<String>,
+    cols: Option<u16>,
+    rows: Option<u16>,
+}
+
 // Real-time Native Linux / POSIX PTY Terminal WebSocket Bridge
 async fn terminal_pty_ws_handler(
     ws: WebSocketUpgrade,
+    Query(query): Query<TerminalQuery>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(handle_pty_terminal_websocket)
+    ws.on_upgrade(move |socket| handle_pty_terminal_websocket(socket, query))
 }
 
-async fn handle_pty_terminal_websocket(socket: WebSocket) {
+async fn handle_pty_terminal_websocket(socket: WebSocket, query: TerminalQuery) {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use std::io::{Read, Write};
 
+    let username = query.username.unwrap_or_else(|| "theysynced".to_string());
+    let clean_user: String = username.chars().filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect();
+    let clean_user = if clean_user.is_empty() { "theysynced".to_string() } else { clean_user };
+
+    // Set up dedicated home directory & workspace directories
+    let home_dir = format!("/home/{}", clean_user);
+    let _ = std::fs::create_dir_all(&home_dir);
+    let _ = std::fs::create_dir_all("/workspace");
+    for sub in &["chats", "docs", "spreadsheets", "drawings", "tasks", "files", "export"] {
+        let _ = std::fs::create_dir_all(format!("/workspace/{}", sub));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&home_dir) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o700);
+            let _ = std::fs::set_permissions(&home_dir, perms);
+        }
+    }
+
+    let cols = query.cols.unwrap_or(100).max(20);
+    let rows = query.rows.unwrap_or(30).max(10);
+
     let pty_system = native_pty_system();
     let pty_pair = match pty_system.openpty(PtySize {
-        rows: 30,
-        cols: 100,
+        rows,
+        cols,
         pixel_width: 0,
         pixel_height: 0,
     }) {
@@ -1178,7 +1212,29 @@ async fn handle_pty_terminal_websocket(socket: WebSocket) {
         }
     };
 
-    let cmd = CommandBuilder::new_default_prog();
+    let shell_path = if std::path::Path::new("/bin/fish").exists() {
+        "/bin/fish"
+    } else if std::path::Path::new("/bin/bash").exists() {
+        "/bin/bash"
+    } else if std::path::Path::new("/bin/sh").exists() {
+        "/bin/sh"
+    } else {
+        "/bin/sh"
+    };
+
+    let mut cmd = CommandBuilder::new(shell_path);
+    cmd.env("USER", &clean_user);
+    cmd.env("HOME", &home_dir);
+    cmd.env("WORKSPACE", "/workspace");
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("SHELL", shell_path);
+    cmd.env("PS1", format!("[{}@theysynced \\W]\\$ ", clean_user));
+    if std::path::Path::new(&home_dir).exists() {
+        cmd.cwd(&home_dir);
+    } else {
+        cmd.cwd("/workspace");
+    }
+
     let mut child = match pty_pair.slave.spawn_command(cmd) {
         Ok(c) => c,
         Err(e) => {
@@ -1202,6 +1258,9 @@ async fn handle_pty_terminal_websocket(socket: WebSocket) {
             return;
         }
     };
+
+    let master_mutex = Arc::new(std::sync::Mutex::new(pty_pair.master));
+    let master_for_resize = master_mutex.clone();
 
     let (mut client_sink, mut client_read) = socket.split();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(200);
@@ -1234,6 +1293,25 @@ async fn handle_pty_terminal_websocket(socket: WebSocket) {
         while let Some(Ok(msg)) = client_read.next().await {
             match msg {
                 Message::Text(txt) => {
+                    // Handle dynamic resize if message is JSON {"type":"resize","cols":...,"rows":...}
+                    if txt.starts_with(r#"{"type":"resize""#) {
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&txt) {
+                            if let (Some(c), Some(r)) = (
+                                val.get("cols").and_then(|v| v.as_u64()),
+                                val.get("rows").and_then(|v| v.as_u64()),
+                            ) {
+                                if let Ok(master) = master_for_resize.lock() {
+                                    let _ = master.resize(PtySize {
+                                        cols: c as u16,
+                                        rows: r as u16,
+                                        pixel_width: 0,
+                                        pixel_height: 0,
+                                    });
+                                }
+                                continue;
+                            }
+                        }
+                    }
                     let _ = writer.write_all(txt.as_bytes());
                     let _ = writer.flush();
                 }
@@ -1253,6 +1331,94 @@ async fn handle_pty_terminal_websocket(socket: WebSocket) {
     }
 
     let _ = child.kill();
+}
+
+#[derive(Deserialize)]
+struct BrowserProxyQuery {
+    url: Option<String>,
+}
+
+// Sandboxed Privacy Edge Proxy for In-App Browser (Strips frame restrictions & protects client IP)
+async fn browser_proxy_handler(
+    Query(query): Query<BrowserProxyQuery>,
+) -> impl IntoResponse {
+    let target_url_str = match query.url {
+        Some(u) if !u.trim().is_empty() => u.trim().to_string(),
+        _ => return (StatusCode::BAD_REQUEST, [(header::CONTENT_TYPE, "text/plain".to_string())], "Missing url parameter".to_string()).into_response(),
+    };
+
+    let full_url = if !target_url_str.starts_with("http://") && !target_url_str.starts_with("https://") {
+        format!("https://{}", target_url_str)
+    } else {
+        target_url_str
+    };
+
+    let parsed_url = match reqwest::Url::parse(&full_url) {
+        Ok(u) => u,
+        Err(e) => return (StatusCode::BAD_REQUEST, [(header::CONTENT_TYPE, "text/plain".to_string())], format!("Invalid URL: {}", e)).into_response(),
+    };
+
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build();
+
+    let client = match client {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, [(header::CONTENT_TYPE, "text/plain".to_string())], format!("Client init error: {}", e)).into_response(),
+    };
+
+    match client.get(parsed_url.clone()).send().await {
+        Ok(resp) => {
+            let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
+            let content_type = resp.headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("text/html")
+                .to_string();
+
+            if content_type.contains("text/html") {
+                match resp.text().await {
+                    Ok(mut html) => {
+                        let base_href = format!("{}://{}{}", parsed_url.scheme(), parsed_url.host_str().unwrap_or(""), parsed_url.path());
+                        let base_tag = format!("<base href=\"{}\">", base_href);
+                        if let Some(pos) = html.find("<head>") {
+                            html.insert_str(pos + 6, &base_tag);
+                        } else if let Some(pos) = html.find("<HEAD>") {
+                            html.insert_str(pos + 6, &base_tag);
+                        } else {
+                            html.insert_str(0, &base_tag);
+                        }
+
+                        (
+                            status,
+                            [
+                                (header::CONTENT_TYPE, content_type),
+                                (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".to_string()),
+                                (header::CACHE_CONTROL, "no-cache".to_string()),
+                            ],
+                            html.into_bytes(),
+                        ).into_response()
+                    }
+                    Err(e) => (StatusCode::BAD_GATEWAY, [(header::CONTENT_TYPE, "text/plain".to_string())], format!("Text error: {}", e).into_bytes()).into_response(),
+                }
+            } else {
+                match resp.bytes().await {
+                    Ok(bytes) => (
+                        status,
+                        [
+                            (header::CONTENT_TYPE, content_type),
+                            (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".to_string()),
+                            (header::CACHE_CONTROL, "no-cache".to_string()),
+                        ],
+                        bytes.to_vec(),
+                    ).into_response(),
+                    Err(e) => (StatusCode::BAD_GATEWAY, [(header::CONTENT_TYPE, "text/plain".to_string())], format!("Fetch error: {}", e).into_bytes()).into_response(),
+                }
+            }
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY, [(header::CONTENT_TYPE, "text/plain".to_string())], format!("Failed to fetch upstream: {}", e).into_bytes()).into_response(),
+    }
 }
 
 // WebSocket real-time engine
