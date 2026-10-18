@@ -485,17 +485,11 @@ export default {
     const backendUrl = env.BACKEND_URL;
     if (backendUrl && (url.pathname.startsWith('/ws/') || url.pathname.startsWith('/rdp-ws/'))) {
       const targetUrl = new URL(url.pathname + url.search, backendUrl);
-      const headers = new Headers(request.headers);
-      headers.set('X-Forwarded-Host', url.host);
-      headers.set('X-Forwarded-Proto', url.protocol.replace(':', ''));
-
       try {
-        return await fetch(targetUrl.toString(), {
-          method: request.method,
-          headers,
-          body: request.body,
-        });
-      } catch (_) {}
+        return await fetch(targetUrl.toString(), request);
+      } catch (err) {
+        console.error('[WebSocket Upstream Error]', err);
+      }
     }
 
     // ── 6. Standalone Cloudflare D1 Serverless API (Zero Server Architecture) ─

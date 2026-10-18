@@ -2,6 +2,7 @@
 /target/
 **/*.rs.bk
 *.pdb
+/workspace/
 # Keep Cargo.lock for reproducible builds (binary project)
 # Cargo.lock
 

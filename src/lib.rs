@@ -1177,13 +1177,28 @@ async fn handle_pty_terminal_websocket(socket: WebSocket, query: TerminalQuery) 
     let clean_user: String = username.chars().filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect();
     let clean_user = if clean_user.is_empty() { "theysynced".to_string() } else { clean_user };
 
-    // Set up dedicated home directory & workspace directories
-    let home_dir = format!("/home/{}", clean_user);
-    let _ = std::fs::create_dir_all(&home_dir);
-    let _ = std::fs::create_dir_all("/workspace");
+    // Set up dedicated home directory & workspace directories (support root /workspace or local workspace)
+    let workspace_path = if std::fs::create_dir_all("/workspace").is_ok() {
+        "/workspace".to_string()
+    } else {
+        let local_ws = std::env::current_dir()
+            .map(|p| p.join("workspace").to_string_lossy().to_string())
+            .unwrap_or_else(|_| "/tmp/theysynced/workspace".to_string());
+        let _ = std::fs::create_dir_all(&local_ws);
+        local_ws
+    };
+
     for sub in &["chats", "docs", "spreadsheets", "drawings", "tasks", "files", "export"] {
-        let _ = std::fs::create_dir_all(format!("/workspace/{}", sub));
+        let _ = std::fs::create_dir_all(format!("{}/{}", workspace_path, sub));
     }
+
+    let home_dir = if std::fs::create_dir_all(format!("/home/{}", clean_user)).is_ok() {
+        format!("/home/{}", clean_user)
+    } else {
+        let fallback_home = format!("{}/home/{}", workspace_path, clean_user);
+        let _ = std::fs::create_dir_all(&fallback_home);
+        fallback_home
+    };
 
     #[cfg(unix)]
     {
@@ -1212,28 +1227,46 @@ async fn handle_pty_terminal_websocket(socket: WebSocket, query: TerminalQuery) 
         }
     };
 
-    let shell_path = if std::path::Path::new("/bin/fish").exists() {
-        "/bin/fish"
-    } else if std::path::Path::new("/bin/bash").exists() {
-        "/bin/bash"
-    } else if std::path::Path::new("/bin/sh").exists() {
-        "/bin/sh"
-    } else {
-        "/bin/sh"
-    };
+    let shell_candidates = [
+        "/bin/fish",
+        "/usr/bin/fish",
+        "/usr/local/bin/fish",
+        "/opt/homebrew/bin/fish",
+        "/bin/bash",
+        "/usr/bin/bash",
+        "/bin/zsh",
+        "/bin/sh",
+    ];
+
+    let shell_path = shell_candidates
+        .iter()
+        .find(|&&p| std::path::Path::new(p).exists())
+        .copied()
+        .unwrap_or_else(|| {
+            if let Ok(sh) = std::env::var("SHELL") {
+                if std::path::Path::new(&sh).exists() {
+                    return Box::leak(sh.into_boxed_str());
+                }
+            }
+            "/bin/sh"
+        });
 
     let mut cmd = CommandBuilder::new(shell_path);
     cmd.env("USER", &clean_user);
     cmd.env("HOME", &home_dir);
-    cmd.env("WORKSPACE", "/workspace");
+    cmd.env("WORKSPACE", &workspace_path);
     cmd.env("TERM", "xterm-256color");
     cmd.env("SHELL", shell_path);
     cmd.env("PS1", format!("[{}@theysynced \\W]\\$ ", clean_user));
-    if std::path::Path::new(&home_dir).exists() {
-        cmd.cwd(&home_dir);
+
+    let cwd = if std::path::Path::new(&home_dir).exists() {
+        &home_dir
+    } else if std::path::Path::new(&workspace_path).exists() {
+        &workspace_path
     } else {
-        cmd.cwd("/workspace");
-    }
+        "/"
+    };
+    cmd.cwd(cwd);
 
     let mut child = match pty_pair.slave.spawn_command(cmd) {
         Ok(c) => c,

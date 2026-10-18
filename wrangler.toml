@@ -32,3 +32,5 @@ id = "299351d2c8f64d7d8d452567f96dd716"
 # ── Environment Variables ──────────────────────────────────────────────────
 [vars]
 RUST_LOG = "info"
+BACKEND_URL = "https://gate-zoo-campaign-most.trycloudflare.com"
+

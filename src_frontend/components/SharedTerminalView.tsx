@@ -148,61 +148,93 @@ export const SharedTerminalView: React.FC<SharedTerminalViewProps> = ({
     }
   };
 
-  // Connect to Real Rust PTY WebSocket
+  // Connect to Real Rust PTY WebSocket with multi-stage tunnel failover
   const tryConnectPty = (term: any): Promise<boolean> => {
     return new Promise((resolve) => {
       try {
         const loc = window.location;
         let wsHost = loc.host;
-        // In local development, Next.js frontend is on 3000 while Rust backend is on 8000
+        // In local development, Next.js frontend is on 3000 while Rust backend is on 8080
         if (loc.port === '3000') {
-          wsHost = `${loc.hostname}:8000`;
+          wsHost = `${loc.hostname}:8080`;
         }
         const wsProto = loc.protocol === 'https:' ? 'wss:' : 'ws:';
         const cols = term?.cols || 100;
         const rows = term?.rows || 30;
         const uname = encodeURIComponent(user?.username || 'user');
-        const wsUrl = `${wsProto}//${wsHost}/ws/terminal?username=${uname}&cols=${cols}&rows=${rows}`;
 
-        const ws = new WebSocket(wsUrl);
-        ws.binaryType = 'arraybuffer';
+        const primaryWsUrl = `${wsProto}//${wsHost}/ws/terminal?username=${uname}&cols=${cols}&rows=${rows}`;
+        const tunnelWsUrl = `wss://gate-zoo-campaign-most.trycloudflare.com/ws/terminal?username=${uname}&cols=${cols}&rows=${rows}`;
 
-        const timeout = setTimeout(() => {
-          ws.close();
-          resolve(false);
-        }, 1800);
+        let resolved = false;
 
-        ws.onopen = () => {
-          clearTimeout(timeout);
-          ptyWsRef.current = ws;
-          activeModeRef.current = 'pty';
-          setIsLive(true);
-          setEngineStatus('Real Linux Container PTY (Native)');
-          term.writeln('\x1b[1;32m✓ Connected to Native Linux / POSIX PTY Session\x1b[0m');
-          term.writeln(`Host: \x1b[1;36m${hostname}\x1b[0m | User: \x1b[1;33m${user.username}\x1b[0m | Full Native Process Execution\r\n`);
-          resolve(true);
-        };
+        const attempt = (targetUrl: string, isFallback: boolean) => {
+          try {
+            const ws = new WebSocket(targetUrl);
+            ws.binaryType = 'arraybuffer';
 
-        ws.onmessage = (event) => {
-          if (event.data instanceof ArrayBuffer) {
-            term.write(new Uint8Array(event.data));
-          } else if (typeof event.data === 'string') {
-            term.write(event.data);
+            const timeout = setTimeout(() => {
+              if (!resolved) {
+                try { ws.close(); } catch (_) {}
+                if (!isFallback && targetUrl !== tunnelWsUrl) {
+                  attempt(tunnelWsUrl, true);
+                } else {
+                  resolved = true;
+                  resolve(false);
+                }
+              }
+            }, isFallback ? 3500 : 2200);
+
+            ws.onopen = () => {
+              if (resolved) return;
+              resolved = true;
+              clearTimeout(timeout);
+              ptyWsRef.current = ws;
+              activeModeRef.current = 'pty';
+              setIsLive(true);
+              setEngineStatus('Real Linux Container PTY (Native)');
+              term.writeln('\x1b[1;32m✓ Connected to Native Linux / POSIX PTY Session\x1b[0m');
+              term.writeln(`Host: \x1b[1;36m${hostname}\x1b[0m | User: \x1b[1;33m${user.username}\x1b[0m | Full Native Process Execution\r\n`);
+              resolve(true);
+            };
+
+            ws.onmessage = (event) => {
+              if (event.data instanceof ArrayBuffer) {
+                term.write(new Uint8Array(event.data));
+              } else if (typeof event.data === 'string') {
+                term.write(event.data);
+              }
+            };
+
+            ws.onerror = () => {
+              if (resolved) return;
+              clearTimeout(timeout);
+              if (!isFallback && targetUrl !== tunnelWsUrl) {
+                attempt(tunnelWsUrl, true);
+              } else {
+                resolved = true;
+                resolve(false);
+              }
+            };
+
+            ws.onclose = () => {
+              if (activeModeRef.current === 'pty') {
+                term.writeln('\r\n\x1b[33m[PTY Session Closed. Switching to Real WebAssembly Linux Kernel...]\x1b[0m\r\n');
+                activeModeRef.current = 'wasm';
+                bootWasmKernel(term);
+              }
+            };
+          } catch {
+            if (!isFallback && targetUrl !== tunnelWsUrl) {
+              attempt(tunnelWsUrl, true);
+            } else if (!resolved) {
+              resolved = true;
+              resolve(false);
+            }
           }
         };
 
-        ws.onerror = () => {
-          clearTimeout(timeout);
-          resolve(false);
-        };
-
-        ws.onclose = () => {
-          if (activeModeRef.current === 'pty') {
-            term.writeln('\r\n\x1b[33m[PTY Session Closed. Switching to Real WebAssembly Linux Kernel...]\x1b[0m\r\n');
-            activeModeRef.current = 'wasm';
-            bootWasmKernel(term);
-          }
-        };
+        attempt(primaryWsUrl, false);
       } catch {
         resolve(false);
       }
