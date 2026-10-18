@@ -91,6 +91,14 @@ export const BrowserView: React.FC<BrowserViewProps> = ({
       return 'https://www.google.com/search?igu=1';
     }
 
+    // YouTube video links: auto-convert to official privacy-enhanced embed for seamless playback
+    if (target.includes('youtube.com/watch') || target.includes('youtu.be/')) {
+      const match = target.match(/(?:v=|\/)([a-zA-Z0-9_-]{11})(?:[&?]|$)/);
+      if (match && match[1]) {
+        return `https://www.youtube-nocookie.com/embed/${match[1]}?autoplay=1`;
+      }
+    }
+
     // Route through privacy edge proxy to strip X-Frame-Options and mask device IP
     return `/api/browser/proxy?url=${encodeURIComponent(target)}`;
   };
@@ -259,10 +267,11 @@ export const BrowserView: React.FC<BrowserViewProps> = ({
 
           <button
             onClick={() => window.open(currentUrl, '_blank', 'noopener,noreferrer')}
-            className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition"
-            title="Open in Native Browser Tab"
+            className="flex items-center space-x-1.5 px-2.5 py-1 rounded-lg text-slate-300 hover:text-white bg-slate-800/80 hover:bg-slate-700 border border-white/10 text-xs font-medium transition"
+            title="Open in Standalone Window"
           >
-            <ExternalLink className="w-4 h-4" />
+            <span>Popout</span>
+            <ExternalLink className="w-3.5 h-3.5" />
           </button>
         </div>
       </div>
@@ -323,6 +332,22 @@ export const BrowserView: React.FC<BrowserViewProps> = ({
         {isLoading && (
           <div className="absolute top-0 left-0 right-0 h-0.5 bg-slate-800 z-10 overflow-hidden">
             <div className="h-full bg-gradient-to-r from-emerald-500 to-teal-400 animate-pulse w-full" />
+          </div>
+        )}
+
+        {/* Notice for complex SPAs like YouTube home feed that block cross-origin iframes */}
+        {currentUrl.includes('youtube.com') && !currentUrl.includes('embed') && !currentUrl.includes('watch') && (
+          <div className="bg-amber-950/80 border-b border-amber-500/30 px-4 py-2 flex items-center justify-between text-xs text-amber-200 z-20 shrink-0">
+            <div className="flex items-center space-x-2">
+              <span className="font-semibold text-amber-300">YouTube Notice:</span>
+              <span className="text-amber-200/90">YouTube&apos;s home feed restricts cross-origin iframe execution. Paste a video link to play it here, or launch YouTube directly:</span>
+            </div>
+            <button
+              onClick={() => window.open('https://youtube.com', '_blank', 'noopener,noreferrer')}
+              className="flex items-center space-x-1.5 px-3 py-1 bg-amber-600 hover:bg-amber-500 text-white font-bold rounded-lg transition shrink-0 ml-3"
+            >
+              <span>Open YouTube ↗</span>
+            </button>
           </div>
         )}
 

@@ -18,24 +18,25 @@ interface SharedTerminalViewProps {
   initialPath?: string;
 }
 
-// Dynamically load v86 WebAssembly emulator script
-function loadV86Script(): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (typeof window === 'undefined') return resolve();
-    if ((window as any).V86Starter) return resolve();
+// Dynamically load browser-safe v86 WebAssembly emulator script
+function loadV86Script(): Promise<any> {
+  return new Promise((resolve) => {
+    if (typeof window === 'undefined') return resolve(null);
+    if ((window as any).V86) return resolve((window as any).V86);
 
     const existing = document.querySelector('script[src="/v86/libv86.js"]');
     if (existing) {
-      existing.addEventListener('load', () => resolve());
-      existing.addEventListener('error', (e) => reject(e));
+      if ((window as any).V86) return resolve((window as any).V86);
+      existing.addEventListener('load', () => resolve((window as any).V86));
+      existing.addEventListener('error', () => resolve(null));
       return;
     }
 
     const script = document.createElement('script');
     script.src = '/v86/libv86.js';
     script.async = true;
-    script.onload = () => resolve();
-    script.onerror = (err) => reject(err);
+    script.onload = () => resolve((window as any).V86);
+    script.onerror = () => resolve(null);
     document.head.appendChild(script);
   });
 }
@@ -77,11 +78,12 @@ export const SharedTerminalView: React.FC<SharedTerminalViewProps> = ({
     try {
       setEngineStatus('Booting Real Linux Kernel in WASM (v5.6.15)...');
       term.writeln('\x1b[1;36mInitializing Real Linux x86 WebAssembly Emulator (v86)...\x1b[0m');
-      term.writeln('Kernel: \x1b[33mLinux 5.6.15-buildroot\x1b[0m | Console: \x1b[32m/dev/ttyS0\x1b[0m\r\n');
+      term.writeln('Kernel: \x1b[33mLinux 5.6.15-buildroot\x1b[0m | Console: \x1b[32m/dev/ttyS0\x1b[0m');
+      term.writeln('Streaming kernel binary (4.9MB) and starting emulator...\r\n');
 
-      await loadV86Script();
+      const V86Class = await loadV86Script();
 
-      if (!(window as any).V86Starter) {
+      if (!V86Class) {
         term.writeln('\x1b[31mError: v86 WebAssembly engine script could not be loaded.\x1b[0m');
         setEngineStatus('WASM Engine Error');
         return;
@@ -93,7 +95,7 @@ export const SharedTerminalView: React.FC<SharedTerminalViewProps> = ({
         } catch (_) {}
       }
 
-      const emulator = new (window as any).V86Starter({
+      const emulator = new V86Class({
         wasm_path: '/v86/v86.wasm',
         memory_size: 64 * 1024 * 1024,
         bios: { url: '/v86/seabios.bin' },
