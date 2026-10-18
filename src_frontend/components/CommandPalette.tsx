@@ -66,8 +66,9 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
     items.push(
       { id: 'tab-overview', type: 'tab', label: 'Office Perks & Company Info', category: 'Workspace navigation', tab: 'overview', icon: Hash },
       { id: 'tab-teams', type: 'tab', label: 'Teams & Channels Hub', category: 'Workspace navigation', tab: 'teams', icon: MessageSquare },
-      { id: 'tab-tasks', type: 'tab', label: 'Jira Tasks Kanban Board', category: 'Workspace navigation', tab: 'tasks', icon: CheckSquare },
+      { id: 'tab-tasks', type: 'tab', label: 'Tasks Board', category: 'Workspace navigation', tab: 'tasks', icon: CheckSquare },
       { id: 'tab-assets', type: 'tab', label: 'Linux File System (GUI)', category: 'Workspace navigation', tab: 'assets', icon: FolderGit2 },
+
       { id: 'tab-terminal', type: 'tab', label: 'Linux Shell Terminal', category: 'Workspace navigation', tab: 'terminal', icon: Terminal },
       { id: 'tab-browser', type: 'tab', label: 'Web Browser & Localhost Dev Inspector', category: 'Workspace navigation', tab: 'browser', icon: Globe },
       { id: 'tab-rdp', type: 'tab', label: 'Remote Desktop (RDP)', category: 'Workspace navigation', tab: 'rdp', icon: Monitor },

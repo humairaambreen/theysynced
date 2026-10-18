@@ -1461,7 +1461,7 @@ From: https://github.com/Homebrew/homebrew-core/blob/master/Formula/${meta.name}
         return { output: `Opening '${basename}' in Docs Tab...`, error: '', newCwd: cwd, openTab: 'docs', openId: basename };
       }
       if (basename.includes('task') || basename.includes('kanban')) {
-        return { output: `Opening Jira Tasks Board in Kanban View...`, error: '', newCwd: cwd, openTab: 'tasks', openId: basename };
+        return { output: `Opening Tasks Board...`, error: '', newCwd: cwd, openTab: 'tasks', openId: basename };
       }
       if (basename.includes('chat')) {
         return { output: `Opening '${basename}' in Teams & Chat Tab...`, error: '', newCwd: cwd, openTab: 'teams', openId: basename };
@@ -1469,8 +1469,8 @@ From: https://github.com/Homebrew/homebrew-core/blob/master/Formula/${meta.name}
       return { output: `Opening '${basename}' in GUI File Manager...`, error: '', newCwd: cwd, openTab: 'assets', openId: basename };
     }
 
-    // 18. JIRA TASK CLI
-    if (cmd === 'task' || cmd === 'tasks' || cmd === 'jira') {
+    // 18. TASK CLI
+    if (cmd === 'task' || cmd === 'tasks' || cmd === 'todo') {
       const sub = args[0]?.toLowerCase() || 'list';
       if (sub === 'list' || sub === 'ls') {
         const tasksContent = this.readFile('/workspace/tasks/tasks.json');
@@ -1487,10 +1487,11 @@ From: https://github.com/Homebrew/homebrew-core/blob/master/Formula/${meta.name}
         }
       }
       if (sub === 'open' || sub === 'board') {
-        return { output: 'Opening Jira Tasks Kanban Board...', error: '', newCwd: cwd, openTab: 'tasks', openId: 'board' };
+        return { output: 'Opening Tasks Board...', error: '', newCwd: cwd, openTab: 'tasks', openId: 'board' };
       }
       return { output: 'Usage: task [list|open]', error: '', newCwd: cwd };
     }
+
 
     // 19. BROWSER CLI
     if (cmd === 'browser' || cmd === 'browse' || cmd === 'surf') {

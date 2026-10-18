@@ -181,8 +181,9 @@ cat README.txt
                   - /workspace/spreadsheets/ (Financial sheets & CSV tables)
                   - /workspace/drawings/     (Excalidraw architecture canvases)
                   - /workspace/docs/         (Knowledgebase documents & Markdown)
-                  - /workspace/tasks/        (Jira Kanban board & task issues)
+                  - /workspace/tasks/        (Task board & team to-dos)
                   - /workspace/files/        (Uploaded files, media, and scripts)
+
                   - /workspace/export/       (Encrypted backups and tarball dumps)
                   - /etc/theysynced/         (Organization configuration & roster)
   * Package Mgr:  APT & Homebrew ready. Use 'sudo apt install <pkg>' or 'brew install <pkg>'
@@ -544,8 +545,9 @@ Unified Operating System Commands:
     wget <url>                   Download file to current folder
     cowsay <text>                ASCII cow text banner
     figlet <text>                ASCII large letter banner
-    task [ls|add|open]           Manage Jira Kanban tasks
+    task [ls|add|open]           Manage workspace tasks
     browser <url>                In-system browser & localhost dev inspector
+
 
   POSIX Core Utilities:
     ls [-l|-a|-h]                List directory contents with octal permissions

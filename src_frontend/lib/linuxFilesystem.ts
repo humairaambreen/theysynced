@@ -551,21 +551,22 @@ export function buildCompanyLinuxFilesystem(
       },
       {
         id: 'TS-104',
-        title: 'Implement shared Jira-style Task Board & Localhost Web Browser',
-        description: 'Create Jira Kanban board synced to /workspace/tasks and in-system browser tab for localhost and web preview.',
+        title: 'Implement shared Task Board & Localhost Web Browser',
+        description: 'Create Kanban task board synced to /workspace/tasks and in-system browser tab for localhost and web preview.',
         status: 'in_progress',
         priority: 'high',
         assignee: user.username,
         creator: user.username,
         created_at: now,
         updated_at: now,
-        tags: ['Frontend', 'Kanban', 'Browser'],
+        tags: ['Frontend', 'Tasks', 'Browser'],
       },
     ];
   }
 
   const tasksJson = JSON.stringify(taskList, null, 2);
-  let kanbanMd = `# ${company.name} Jira Task Board\nLast Updated: ${now}\n\n`;
+  let kanbanMd = `# ${company.name} Tasks\nLast Updated: ${now}\n\n`;
+
   const taskStatuses = ['backlog', 'todo', 'in_progress', 'review', 'done'];
   taskStatuses.forEach((st) => {
     const items = taskList.filter((t) => t.status === st);

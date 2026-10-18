@@ -157,8 +157,9 @@ export default function App() {
           setActiveTeamId(found.id);
         }
       }
-    } else if (section === 'tasks' || section === 'jira' || section === 'kanban') {
+    } else if (section === 'tasks' || section === 'todo' || section === 'kanban') {
       setActiveTab('tasks');
+
     } else if (section === 'browser' || section === 'web') {
       setActiveTab('browser');
     } else if (section === 'assets' || section === 'storage' || section === 'files') {

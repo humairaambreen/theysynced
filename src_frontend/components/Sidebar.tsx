@@ -14,8 +14,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const navItems: { id: ActiveTab; label: string; icon: React.FC<{ className?: string }> }[] = [
     { id: 'overview', label: 'Office Perks', icon: LayoutGrid },
     { id: 'teams', label: 'Teams & Chat', icon: MessageSquare },
-    { id: 'tasks', label: 'Jira Tasks', icon: CheckSquare },
+    { id: 'tasks', label: 'Tasks', icon: CheckSquare },
     { id: 'assets', label: 'File System (GUI)', icon: FolderGit2 },
+
     { id: 'terminal', label: 'Linux Terminal', icon: Terminal },
     { id: 'browser', label: 'Web Browser', icon: Globe },
     { id: 'rdp', label: 'Remote Desktop', icon: Monitor },

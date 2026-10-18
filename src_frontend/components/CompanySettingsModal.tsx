@@ -591,7 +591,8 @@ export const CompanySettingsModal: React.FC<CompanySettingsModalProps> = ({
               </div>
               <p className="text-xs text-slate-500 leading-relaxed">
                 Leaving <strong>{company.name}</strong> will revoke your access to all teams, encrypted chat channels,
-                whiteboards, spreadsheets, documents, and Jira tasks in this workspace. You will need a new invite code to re-join.
+                whiteboards, spreadsheets, documents, and tasks in this workspace. You will need a new invite code to re-join.
+
               </p>
 
               {!showLeaveConfirm ? (
