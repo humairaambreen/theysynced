@@ -436,6 +436,8 @@ export function buildCompanyLinuxFilesystem(
   const standardFiles = assets.filter((a) => a.asset_type === 'file' || a.asset_type === 'pdf');
   standardFiles.forEach((sf) => {
     if (sf.id.startsWith('terminal_') || sf.id.startsWith('chat_asset_')) return;
+    // Filter out internal build zips or temporary archives
+    if (sf.name === 'WebRDP-main.zip' || sf.name.endsWith('.zip.tmp')) return;
 
     // Permission checks
     if (sf.scope === 'private') {

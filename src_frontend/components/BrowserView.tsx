@@ -71,13 +71,28 @@ export const BrowserView: React.FC<BrowserViewProps> = ({
     return `https://www.google.com/search?igu=1&q=${encodeURIComponent(trimmed)}`;
   };
 
-  // Get target URL for the iframe: Google igu=1 loads natively, others load directly
+  // Get target URL for the iframe:
+  // - Localhost and 127.0.0.1 load directly for local dev testing (port 3000, 8080, 5173)
+  // - Google with igu=1 loads directly without proxy overhead
+  // - All other external websites are routed through /api/browser/proxy to strip X-Frame-Options/CSP and protect IP
   const getIframeUrl = (target: string): string => {
     if (!target) return 'https://www.google.com/search?igu=1';
-    if (target.includes('google.com') && !target.includes('igu=1')) {
-      return target.includes('?') ? `${target}&igu=1` : `${target}?igu=1`;
+
+    // Localhost dev servers run directly
+    if (target.includes('localhost') || target.includes('127.0.0.1')) {
+      return target;
     }
-    return target;
+
+    // Google igu=1 allows native iframe embedding
+    if (target.includes('google.com/search') && target.includes('igu=1')) {
+      return target;
+    }
+    if (target.includes('google.com') && !target.includes('search')) {
+      return 'https://www.google.com/search?igu=1';
+    }
+
+    // Route through privacy edge proxy to strip X-Frame-Options and mask device IP
+    return `/api/browser/proxy?url=${encodeURIComponent(target)}`;
   };
 
   // Navigate to Target URL
