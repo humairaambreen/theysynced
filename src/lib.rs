@@ -126,6 +126,7 @@ pub fn create_app(state: AppState) -> Router {
         // Realtime WebSockets Hub
         .route("/ws/:session_id", get(websocket_handler))
         .route("/rdp-ws", get(rdp_websocket_handler))
+        .route("/ws/terminal", get(terminal_pty_ws_handler))
 
         // Storage / Media API (Cloudflare R2 & Local fallback)
         .route("/api/storage/upload", post(upload_storage_handler))
@@ -1150,6 +1151,108 @@ async fn handle_rdp_websocket(client_socket: WebSocket) {
             tracing::error!("Failed to connect to RDP proxy upstream at {}: {}", rdp_url, e);
         }
     }
+}
+
+// Real-time Native Linux / POSIX PTY Terminal WebSocket Bridge
+async fn terminal_pty_ws_handler(
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    ws.on_upgrade(handle_pty_terminal_websocket)
+}
+
+async fn handle_pty_terminal_websocket(socket: WebSocket) {
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use std::io::{Read, Write};
+
+    let pty_system = native_pty_system();
+    let pty_pair = match pty_system.openpty(PtySize {
+        rows: 30,
+        cols: 100,
+        pixel_width: 0,
+        pixel_height: 0,
+    }) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!("Failed to open PTY: {}", e);
+            return;
+        }
+    };
+
+    let cmd = CommandBuilder::new_default_prog();
+    let mut child = match pty_pair.slave.spawn_command(cmd) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Failed to spawn shell in PTY: {}", e);
+            return;
+        }
+    };
+
+    let mut reader = match pty_pair.master.try_clone_reader() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("Failed to clone PTY reader: {}", e);
+            return;
+        }
+    };
+
+    let mut writer = match pty_pair.master.take_writer() {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::error!("Failed to take PTY writer: {}", e);
+            return;
+        }
+    };
+
+    let (mut client_sink, mut client_read) = socket.split();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(200);
+
+    // Dedicated reader thread for the synchronous PTY stream
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let ws_send_task = tokio::spawn(async move {
+        while let Some(data) = rx.recv().await {
+            if client_sink.send(Message::Binary(data)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let ws_recv_task = tokio::spawn(async move {
+        while let Some(Ok(msg)) = client_read.next().await {
+            match msg {
+                Message::Text(txt) => {
+                    let _ = writer.write_all(txt.as_bytes());
+                    let _ = writer.flush();
+                }
+                Message::Binary(bin) => {
+                    let _ = writer.write_all(&bin);
+                    let _ = writer.flush();
+                }
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+    });
+
+    tokio::select! {
+        _ = ws_send_task => {},
+        _ = ws_recv_task => {},
+    }
+
+    let _ = child.kill();
 }
 
 // WebSocket real-time engine
