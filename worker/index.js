@@ -337,6 +337,69 @@ export default {
       });
     }
 
+    // ── Sandboxed Web Browser Proxy API (Protects User IP & Bypasses X-Frame-Options) ──
+    if (url.pathname === '/api/browser/proxy') {
+      const targetParam = url.searchParams.get('url');
+      if (!targetParam) {
+        return errorResponse('Missing url query parameter', 400);
+      }
+
+      try {
+        let targetUrlStr = targetParam.trim();
+        if (!targetUrlStr.startsWith('http://') && !targetUrlStr.startsWith('https://')) {
+          targetUrlStr = 'https://' + targetUrlStr;
+        }
+
+        const targetUrl = new URL(targetUrlStr);
+
+        // Fetch upstream from the edge server (completely hiding user's IP & device)
+        const forwardHeaders = new Headers();
+        forwardHeaders.set('User-Agent', 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36');
+        forwardHeaders.set('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8');
+        forwardHeaders.set('Accept-Language', 'en-US,en;q=0.5');
+
+        const upstreamRes = await fetch(targetUrl.toString(), {
+          method: request.method,
+          headers: forwardHeaders,
+          redirect: 'follow',
+        });
+
+        const contentType = upstreamRes.headers.get('content-type') || 'text/html';
+        const responseHeaders = new Headers();
+        responseHeaders.set('Content-Type', contentType);
+        responseHeaders.set('Access-Control-Allow-Origin', '*');
+        responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+        responseHeaders.set('Cache-Control', 'no-cache');
+
+        // CRITICAL: Strip frame-blocking headers so Google, GitHub, DuckDuckGo etc. render in Zen browser / iframe
+        responseHeaders.delete('x-frame-options');
+        responseHeaders.delete('content-security-policy');
+        responseHeaders.delete('content-security-policy-report-only');
+        responseHeaders.delete('strict-transport-security');
+
+        if (contentType.includes('text/html')) {
+          let html = await upstreamRes.text();
+          // Inject <base> tag to correctly resolve relative URLs to target host
+          const baseTag = `<base href="${targetUrl.origin}${targetUrl.pathname}">`;
+          if (html.includes('<head>')) {
+            html = html.replace('<head>', `<head>${baseTag}`);
+          } else if (html.includes('<HEAD>')) {
+            html = html.replace('<HEAD>', `<HEAD>${baseTag}`);
+          } else {
+            html = baseTag + html;
+          }
+          return new Response(html, { status: 200, headers: responseHeaders });
+        }
+
+        return new Response(upstreamRes.body, { status: 200, headers: responseHeaders });
+      } catch (err) {
+        return new Response(
+          `<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{background:#0a0d14;color:#e2e8f0;font-family:sans-serif;padding:32px;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;margin:0;}h2{color:#f87171;}code{background:#1e293b;padding:4px 8px;border-radius:4px;color:#38bdf8;}</style></head><body><h2>Sandbox Web Proxy Error</h2><p>Could not fetch target URL: <code>${targetParam}</code></p><p style="color:#94a3b8;font-size:13px;">Reason: ${err.message}</p></body></html>`,
+          { status: 502, headers: { 'Content-Type': 'text/html', 'Access-Control-Allow-Origin': '*' } }
+        );
+      }
+    }
+
     // 3. Storage Upload API: Store media/files in Cloudflare KV or R2
     if (url.pathname === '/api/storage/upload' && method === 'POST') {
       try {

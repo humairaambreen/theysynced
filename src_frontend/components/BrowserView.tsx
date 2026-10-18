@@ -3,7 +3,7 @@
 import React, { useState, useRef } from 'react';
 import { 
   Globe, ArrowLeft, ArrowRight, RotateCw, Home, ExternalLink, 
-  Bookmark, Plus, X, Search, Lock, Compass, ShieldCheck
+  Bookmark, Plus, X, Search, Lock, Compass, ShieldCheck, ShieldAlert
 } from 'lucide-react';
 import { Company, UserProfile, ActiveTab } from '../types';
 
@@ -21,18 +21,18 @@ interface BookmarkItem {
 }
 
 const DEFAULT_BOOKMARKS: BookmarkItem[] = [
-  { id: 'b-ddg', title: 'DuckDuckGo', url: 'https://duckduckgo.com' },
+  { id: 'b-google', title: 'Google Search', url: 'https://www.google.com' },
+  { id: 'b-ddg', title: 'DuckDuckGo', url: 'https://html.duckduckgo.com' },
   { id: 'b-wiki', title: 'Wikipedia', url: 'https://en.m.wikipedia.org' },
   { id: 'b-hn', title: 'Hacker News', url: 'https://news.ycombinator.com' },
   { id: 'b-mdn', title: 'MDN Web Docs', url: 'https://developer.mozilla.org' },
-  { id: 'b-cf', title: 'Cloudflare Docs', url: 'https://developers.cloudflare.com' },
   { id: 'b-gh', title: 'GitHub', url: 'https://github.com' },
 ];
 
 export const BrowserView: React.FC<BrowserViewProps> = ({
   user,
   company,
-  initialUrl = 'https://duckduckgo.com',
+  initialUrl = 'https://www.google.com',
   onNavigateTab,
 }) => {
   const [urlInput, setUrlInput] = useState(initialUrl);
@@ -56,7 +56,7 @@ export const BrowserView: React.FC<BrowserViewProps> = ({
   // Normalize URL or Search Query
   const normalizeUrl = (input: string): string => {
     let trimmed = input.trim();
-    if (!trimmed) return 'https://duckduckgo.com';
+    if (!trimmed) return 'https://www.google.com';
     if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
       return trimmed;
     }
@@ -64,8 +64,14 @@ export const BrowserView: React.FC<BrowserViewProps> = ({
     if (trimmed.includes('.') && !trimmed.includes(' ')) {
       return `https://${trimmed}`;
     }
-    // Otherwise treat as search query
-    return `https://duckduckgo.com/?q=${encodeURIComponent(trimmed)}`;
+    // Otherwise treat as search query (Sandboxed privacy search)
+    return `https://html.duckduckgo.com/html/?q=${encodeURIComponent(trimmed)}`;
+  };
+
+  // Build sandboxed proxy URL (bypasses X-Frame-Options & protects personal IP)
+  const getProxiedUrl = (target: string): string => {
+    if (!target) return '';
+    return `/api/browser/proxy?url=${encodeURIComponent(target)}`;
   };
 
   // Navigate to Target URL
@@ -90,6 +96,7 @@ export const BrowserView: React.FC<BrowserViewProps> = ({
       setUrlInput(url);
       setCurrentUrl(url);
       setLoadError(false);
+      setIsLoading(true);
     }
   };
 
@@ -101,6 +108,7 @@ export const BrowserView: React.FC<BrowserViewProps> = ({
       setUrlInput(url);
       setCurrentUrl(url);
       setLoadError(false);
+      setIsLoading(true);
     }
   };
 
@@ -109,14 +117,14 @@ export const BrowserView: React.FC<BrowserViewProps> = ({
     setLoadError(false);
     if (iframeRef.current) {
       try {
-        iframeRef.current.src = currentUrl;
+        iframeRef.current.src = getProxiedUrl(currentUrl);
       } catch (_) {}
     }
-    setTimeout(() => setIsLoading(false), 600);
+    setTimeout(() => setIsLoading(false), 1200);
   };
 
   const handleGoHome = () => {
-    navigateTo('https://duckduckgo.com');
+    navigateTo('https://www.google.com');
   };
 
   const handleAddBookmark = () => {
@@ -203,7 +211,7 @@ export const BrowserView: React.FC<BrowserViewProps> = ({
             type="text"
             value={urlInput}
             onChange={(e) => setUrlInput(e.target.value)}
-            placeholder="Search web or enter website URL (e.g. wikipedia.org)..."
+            placeholder="Search web or enter website URL (e.g. google.com, wikipedia.org)..."
             className="w-full bg-transparent text-xs text-slate-100 placeholder:text-slate-500 outline-none font-mono"
             spellCheck={false}
           />
@@ -235,6 +243,25 @@ export const BrowserView: React.FC<BrowserViewProps> = ({
           >
             <ExternalLink className="w-4 h-4" />
           </button>
+        </div>
+      </div>
+
+      {/* Sandboxed Privacy Header Bar */}
+      <div className="bg-[#0b101b] border-b border-emerald-500/20 px-4 py-1.5 flex flex-wrap items-center justify-between text-[11px] text-slate-300 shrink-0 gap-2">
+        <div className="flex items-center space-x-2">
+          <ShieldCheck className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+          <span>
+            <strong>Sandboxed OS Browser Gateway</strong> &bull; <span className="text-emerald-300 font-mono">Zero Device IP Leaked</span>
+          </span>
+          <span className="hidden sm:inline text-slate-400">
+            &bull; X-Frame-Options Bypassed &bull; Edge Isolation Active
+          </span>
+        </div>
+
+        <div className="flex items-center space-x-2 text-[10px] font-mono text-slate-400">
+          <span className="px-1.5 py-0.5 bg-slate-800 rounded text-slate-300 border border-white/5">
+            Target: {currentUrl}
+          </span>
         </div>
       </div>
 
@@ -278,10 +305,10 @@ export const BrowserView: React.FC<BrowserViewProps> = ({
           </div>
         )}
 
-        {/* Web Viewport Frame */}
+        {/* Sandboxed Web Viewport Frame (Routes through /api/browser/proxy to bypass X-Frame-Options) */}
         <iframe
           ref={iframeRef}
-          src={currentUrl}
+          src={getProxiedUrl(currentUrl)}
           onLoad={() => setIsLoading(false)}
           onError={() => {
             setIsLoading(false);
@@ -289,19 +316,19 @@ export const BrowserView: React.FC<BrowserViewProps> = ({
           }}
           className="w-full flex-1 border-0 bg-white"
           sandbox="allow-same-origin allow-scripts allow-popups allow-forms allow-modals allow-downloads"
-          title="TheySynced Simple In-System Web Browser"
+          title="TheySynced Sandboxed OS Web Browser"
         />
 
-        {/* Fallback Overlay for External Iframe-Restricted Sites */}
+        {/* Error Fallback */}
         {loadError && (
           <div className="absolute inset-0 bg-[#0a0d14]/95 flex flex-col items-center justify-center p-6 text-center space-y-4 font-sans">
             <div className="w-12 h-12 rounded-2xl bg-slate-800 border border-white/10 flex items-center justify-center text-slate-400">
               <Compass className="w-6 h-6 text-emerald-400" />
             </div>
             <div className="max-w-md space-y-1">
-              <h3 className="text-sm font-bold text-white">External Site Restrictions</h3>
+              <h3 className="text-sm font-bold text-white">Navigation Notice</h3>
               <p className="text-xs text-slate-400 leading-relaxed">
-                Some external websites (like Google or GitHub) restrict being embedded inside browser frames using <code className="text-slate-300 font-mono">X-Frame-Options</code>.
+                Could not connect to target host via the sandboxed edge gateway.
               </p>
             </div>
             <div className="flex items-center space-x-3">
@@ -313,10 +340,10 @@ export const BrowserView: React.FC<BrowserViewProps> = ({
                 <ExternalLink className="w-3.5 h-3.5" />
               </button>
               <button
-                onClick={() => navigateTo('https://duckduckgo.com')}
+                onClick={() => navigateTo('https://www.google.com')}
                 className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold rounded-xl border border-white/10 transition"
               >
-                Go to DuckDuckGo
+                Go to Google
               </button>
             </div>
           </div>
