@@ -30,6 +30,16 @@ export interface ShellExecResult {
   enterNodeRepl?: boolean;
   switchUser?: string;
   installedPackagesChanged?: string[];
+  fileCreatedOrModified?: {
+    path: string;
+    name: string;
+    content: string;
+    folder_path: string;
+    isDir?: boolean;
+  };
+  fileDeleted?: {
+    path: string;
+  };
 }
 
 export class LinuxVirtualKernel {
@@ -365,6 +375,58 @@ Description: ${meta.description}
   }
 
   /**
+   * Auto-complete suggestions for command line input
+   */
+  public getCompletions(input: string, cwd: string, username: string): string[] {
+    const trimmed = input.trimStart();
+    if (!trimmed) return [];
+
+    const tokens = trimmed.split(/\s+/);
+    const lastToken = tokens[tokens.length - 1] || '';
+
+    // If typing first command
+    if (tokens.length === 1 && !input.endsWith(' ')) {
+      const builtins = [
+        'apt', 'apt-get', 'brew', 'cat', 'cd', 'chmod', 'chown', 'clear', 'cowsay', 
+        'cp', 'curl', 'date', 'df', 'diff', 'echo', 'exit', 'export-org', 'figlet', 
+        'find', 'free', 'gcc', 'git', 'grep', 'gui', 'head', 'help', 'history', 
+        'hostname', 'htop', 'id', 'kill', 'ls', 'man', 'mkdir', 'mv', 'nano', 
+        'nautilus', 'neofetch', 'node', 'npm', 'open', 'pip', 'ps', 'pwd', 
+        'python3', 'python', 'rm', 'rmdir', 'stat', 'su', 'sudo', 'tail', 
+        'task', 'tasks', 'top', 'touch', 'tree', 'uname', 'vim', 'wc', 'wget', 'whoami'
+      ];
+      const pkgBinaries = Array.from(this.installedPackages);
+      const allCommands = Array.from(new Set([...builtins, ...pkgBinaries]));
+      return allCommands.filter((c) => c.startsWith(lastToken));
+    }
+
+    // Otherwise complete path for file/directory
+    let targetDir = cwd;
+    let filePrefix = lastToken;
+
+    if (lastToken.includes('/')) {
+      const lastSlashIdx = lastToken.lastIndexOf('/');
+      const dirPart = lastToken.substring(0, lastSlashIdx) || '/';
+      filePrefix = lastToken.substring(lastSlashIdx + 1);
+      targetDir = this.normalizePath(dirPart, cwd, username);
+    }
+
+    const entries = this.readdir(targetDir);
+    if (!entries) return [];
+
+    const matches: string[] = [];
+    for (const name of entries) {
+      if (name.toLowerCase().startsWith(filePrefix.toLowerCase())) {
+        const fullChild = targetDir === '/' ? `/${name}` : `${targetDir}/${name}`;
+        const node = this.stat(fullChild);
+        matches.push(node?.type === 'dir' ? `${name}/` : name);
+      }
+    }
+
+    return matches;
+  }
+
+  /**
    * Execute Shell Command Line (with pipes | and redirects >)
    */
   public async executeCommandLine(
@@ -420,7 +482,14 @@ Description: ${meta.description}
         const prev = redirAppend ? (this.readFile(targetPath) || '') : '';
         const toWrite = prev + (pipeInput.endsWith('\n') ? pipeInput : pipeInput + '\n');
         this.writeFile(targetPath, toWrite, isRoot ? 'root' : username);
-        return { output: `Written ${toWrite.length} bytes to ${redirFile}`, error: '', newCwd: lastCwd };
+        const name = targetPath.split('/').pop() || redirFile;
+        const folder_path = targetPath.substring(0, targetPath.lastIndexOf('/')) || '/workspace';
+        return { 
+          output: `Written ${toWrite.length} bytes to ${redirFile}`, 
+          error: '', 
+          newCwd: lastCwd,
+          fileCreatedOrModified: targetPath.startsWith('/workspace') ? { path: targetPath, name, content: toWrite, folder_path } : undefined,
+        };
       }
 
       return { output: pipeInput, error: '', newCwd: lastCwd };
@@ -438,6 +507,11 @@ Description: ${meta.description}
       const toWrite = prev + (res.output.endsWith('\n') ? res.output : res.output + '\n');
       this.writeFile(targetPath, toWrite, isRoot ? 'root' : username);
       res.output = `Written ${toWrite.length} bytes to ${redirFile}`;
+      if (targetPath.startsWith('/workspace')) {
+        const name = targetPath.split('/').pop() || redirFile;
+        const folder_path = targetPath.substring(0, targetPath.lastIndexOf('/')) || '/workspace';
+        res.fileCreatedOrModified = { path: targetPath, name, content: toWrite, folder_path };
+      }
     }
 
     return res;
@@ -684,21 +758,33 @@ Description: ${meta.description}
       if (!allowed) return { output: '', error: pErr, newCwd: cwd };
 
       this.mkdir(p, effectiveUser);
-      return { output: '', error: '', newCwd: cwd };
+      let fileCreatedOrModified: any = undefined;
+      if (p.startsWith('/workspace')) {
+        const name = p.split('/').pop() || target;
+        const folder_path = p.substring(0, p.lastIndexOf('/')) || '/workspace';
+        fileCreatedOrModified = { path: p, name, content: '', folder_path, isDir: true };
+      }
+      return { output: '', error: '', newCwd: cwd, fileCreatedOrModified };
     }
 
     // 9. TOUCH
     if (cmd === 'touch') {
       if (args.length === 0) return { output: '', error: 'touch: missing file operand', newCwd: cwd };
+      let fileCreatedOrModified: any = undefined;
       for (const arg of args) {
         const p = this.normalizePath(arg, cwd, effectiveUser);
         const [allowed, pErr] = this.checkPermission(p, effectiveUser, effectiveIsRoot, isAdmin);
         if (!allowed) return { output: '', error: pErr, newCwd: cwd };
         if (!this.stat(p)) {
           this.writeFile(p, '', effectiveUser);
+          if (p.startsWith('/workspace')) {
+            const name = p.split('/').pop() || arg;
+            const folder_path = p.substring(0, p.lastIndexOf('/')) || '/workspace';
+            fileCreatedOrModified = { path: p, name, content: '', folder_path };
+          }
         }
       }
-      return { output: '', error: '', newCwd: cwd };
+      return { output: '', error: '', newCwd: cwd, fileCreatedOrModified };
     }
 
     // 10. RM
@@ -706,6 +792,7 @@ Description: ${meta.description}
       const isRecursive = args.some((a) => a.includes('r') || a.includes('R'));
       const targets = args.filter((a) => !a.startsWith('-'));
       if (targets.length === 0) return { output: '', error: 'rm: missing operand', newCwd: cwd };
+      let fileDeleted: any = undefined;
 
       for (const t of targets) {
         const p = this.normalizePath(t, cwd, effectiveUser);
@@ -723,8 +810,11 @@ Description: ${meta.description}
         } else {
           this.unlink(p);
         }
+        if (p.startsWith('/workspace')) {
+          fileDeleted = { path: p };
+        }
       }
-      return { output: '', error: '', newCwd: cwd };
+      return { output: '', error: '', newCwd: cwd, fileDeleted };
     }
 
     // 11. CP / MV
