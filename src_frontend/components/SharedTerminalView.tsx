@@ -3,6 +3,7 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Company, Team, ChatMessage, UserProfile, WorkspaceAsset, ActiveTab } from '../types';
 import { Terminal as TerminalIcon, RotateCcw, Power, ShieldCheck, Check } from 'lucide-react';
+import { buildCompanyLinuxFilesystem } from '../lib/linuxFilesystem';
 import 'xterm/css/xterm.css';
 
 interface SharedTerminalViewProps {
@@ -73,6 +74,10 @@ export const SharedTerminalView: React.FC<SharedTerminalViewProps> = ({
     return `arch-${slug}`;
   }, [company.name]);
 
+  const { entries: linuxEntries } = useMemo(() => {
+    return buildCompanyLinuxFilesystem(company, teams, chatMessages, assets, user);
+  }, [company, teams, chatMessages, assets, user]);
+
   // Boot Real WebAssembly Linux Kernel (Linux 5.6.15 Buildroot)
   const bootWasmKernel = async (term: any) => {
     try {
@@ -102,6 +107,7 @@ export const SharedTerminalView: React.FC<SharedTerminalViewProps> = ({
         vga_bios: { url: '/v86/vgabios.bin' },
         bzimage: { url: '/v86/buildroot-bzimage.bin' },
         cmdline: 'console=ttyS0 root=/dev/ram0 rw quiet',
+        filesystem: {},
         autostart: true,
       });
 
@@ -114,6 +120,26 @@ export const SharedTerminalView: React.FC<SharedTerminalViewProps> = ({
       emulator.add_listener('serial0-output-byte', (byte: number) => {
         term.write(String.fromCharCode(byte));
       });
+
+      // Mount all company workspace assets into the 9p filesystem (/mnt)
+      const enc = new TextEncoder();
+      for (const entry of linuxEntries) {
+        if (entry.type === 'file' && entry.content) {
+          const cleanName = entry.path.replace(/^\/workspace\//, '').replace(/\//g, '_');
+          try {
+            await emulator.create_file(cleanName, enc.encode(entry.content));
+          } catch (_) {}
+        }
+      }
+
+      // Link /mnt to /workspace inside the Linux VM once the kernel shell is ready
+      let mounted = false;
+      setTimeout(() => {
+        if (!mounted && v86InstanceRef.current) {
+          mounted = true;
+          v86InstanceRef.current.serial0_send('mkdir -p /workspace && cd /workspace && ln -sf /mnt/* . 2>/dev/null; cd ~\n');
+        }
+      }, 3500);
 
       term.writeln('\x1b[32m✓ Real Linux Kernel running directly in WebAssembly.\x1b[0m\r\n');
     } catch (err: any) {
