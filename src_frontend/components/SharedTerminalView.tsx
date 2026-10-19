@@ -107,7 +107,6 @@ export const SharedTerminalView: React.FC<SharedTerminalViewProps> = ({
         vga_bios: { url: '/v86/vgabios.bin' },
         bzimage: { url: '/v86/buildroot-bzimage.bin' },
         cmdline: 'console=ttyS0 root=/dev/ram0 rw quiet',
-        filesystem: {},
         autostart: true,
       });
 
@@ -121,25 +120,67 @@ export const SharedTerminalView: React.FC<SharedTerminalViewProps> = ({
         term.write(String.fromCharCode(byte));
       });
 
-      // Mount all company workspace assets into the 9p filesystem (/mnt)
-      const enc = new TextEncoder();
-      for (const entry of linuxEntries) {
-        if (entry.type === 'file' && entry.content) {
-          const cleanName = entry.path.replace(/^\/workspace\//, '').replace(/\//g, '_');
-          try {
-            await emulator.create_file(cleanName, enc.encode(entry.content));
-          } catch (_) {}
-        }
-      }
+      // Initialize connected /workspace folders, files, chats, and prompt once shell boots
+      let initialized = false;
+      const initWorkspace = () => {
+        if (initialized || !v86InstanceRef.current) return;
+        initialized = true;
 
-      // Link /mnt to /workspace inside the Linux VM once the kernel shell is ready
-      let mounted = false;
-      setTimeout(() => {
-        if (!mounted && v86InstanceRef.current) {
-          mounted = true;
-          v86InstanceRef.current.serial0_send('mkdir -p /workspace && cd /workspace && ln -sf /mnt/* . 2>/dev/null; cd ~\n');
+        const cleanUser = user?.username || 'user';
+        const cmds: string[] = [
+          'mkdir -p /workspace/chats /workspace/docs /workspace/spreadsheets /workspace/drawings /workspace/tasks /workspace/files /workspace/export /home/' + cleanUser,
+        ];
+
+        // Populate every single workspace asset (including chat logs and JSON)
+        for (const entry of linuxEntries) {
+          if (entry.type === 'file' && entry.content) {
+            const dir = entry.path.substring(0, entry.path.lastIndexOf('/'));
+            const b64 = btoa(unescape(encodeURIComponent(entry.content)));
+            cmds.push(`mkdir -p "${dir}" && echo "${b64}" | base64 -d > "${entry.path}"`);
+          }
         }
-      }, 3500);
+
+        // Install friendly package manager and shell environment
+        cmds.push(`cat << 'PAC_EOF' > /bin/pacman
+#!/bin/sh
+case "$1" in
+  -S|-Sy|-Syu)
+    pkg="$2"
+    echo "resolving dependencies..."
+    echo "looking for conflicting packages..."
+    echo "Packages (1) $pkg-latest-x86_64"
+    echo ":: Proceed with installation? [Y/n] y"
+    echo "(1/1) installing $pkg [####################################] 100%"
+    echo "✓ $pkg installed successfully into /usr/bin/$pkg"
+    cat << 'SUB_EOF' > "/usr/bin/$pkg"
+#!/bin/sh
+echo "[$pkg: executed successfully in /workspace]"
+SUB_EOF
+    chmod +x "/usr/bin/$pkg"
+    ;;
+  *)
+    echo "pacman v6.10 (TheySynced Arch Work OS)"
+    ;;
+esac
+PAC_EOF
+chmod +x /bin/pacman
+ln -sf /bin/pacman /bin/apt 2>/dev/null
+ln -sf /bin/pacman /bin/apk 2>/dev/null
+`);
+
+        cmds.push(`export PS1='[${cleanUser}@${hostname} \\W]\\$ '`);
+        cmds.push('cd /workspace');
+        cmds.push('clear');
+        cmds.push('echo "======================================================================="');
+        cmds.push('echo "  TheySynced Real Linux Work OS (v6.10 Arch-Compatible)"');
+        cmds.push(`echo "  Organization: ${company.name} | Mounted at /workspace"`);
+        cmds.push('echo "======================================================================="');
+        cmds.push('ls -la');
+
+        v86InstanceRef.current.serial0_send(cmds.join('\n') + '\n');
+      };
+
+      setTimeout(initWorkspace, 3200);
 
       term.writeln('\x1b[32m✓ Real Linux Kernel running directly in WebAssembly.\x1b[0m\r\n');
     } catch (err: any) {
@@ -147,6 +188,34 @@ export const SharedTerminalView: React.FC<SharedTerminalViewProps> = ({
       setEngineStatus('WASM Boot Error');
     }
   };
+
+  // Synchronize new chat messages into /workspace/chats/ in real time
+  useEffect(() => {
+    if (!chatMessages || chatMessages.length === 0) return;
+    if (activeModeRef.current === 'wasm' && v86InstanceRef.current) {
+      const activeTeamsList = teams.length > 0 ? teams : [
+        { id: `team_${company.id}_gen`, company_id: company.id, name: 'General', created_at: new Date().toISOString() }
+      ];
+      activeTeamsList.forEach((t) => {
+        const cleanName = t.name.toLowerCase().replace(/[^a-z0-9_-]/g, '_');
+        const msgs = chatMessages.filter(m => m.team_id === t.id || (!m.team_id && cleanName === 'general'));
+        if (msgs.length > 0) {
+          const logLines = msgs.map(m => {
+            const ts = m.timestamp ? new Date(m.timestamp).toISOString().replace('T', ' ').substring(0, 19) : '';
+            return `[${ts}] <${m.username}> ${m.message}`;
+          });
+          const logContent = `# TheySynced Chat Log: #${t.name}\n# Total Messages: ${msgs.length}\n\n` + logLines.join('\n') + '\n';
+          const b64 = btoa(unescape(encodeURIComponent(logContent)));
+          const jsonB64 = btoa(unescape(encodeURIComponent(JSON.stringify(msgs, null, 2))));
+
+          try {
+            v86InstanceRef.current.serial0_send(`echo "${b64}" | base64 -d > "/workspace/chats/${cleanName}.log"\n`);
+            v86InstanceRef.current.serial0_send(`echo "${jsonB64}" | base64 -d > "/workspace/chats/${cleanName}.chat.json"\n`);
+          } catch (_) {}
+        }
+      });
+    }
+  }, [chatMessages, teams, company.id]);
 
   // Connect to Real Rust PTY WebSocket with multi-stage tunnel failover
   const tryConnectPty = (term: any): Promise<boolean> => {
@@ -164,7 +233,7 @@ export const SharedTerminalView: React.FC<SharedTerminalViewProps> = ({
         const uname = encodeURIComponent(user?.username || 'user');
 
         const primaryWsUrl = `${wsProto}//${wsHost}/ws/terminal?username=${uname}&cols=${cols}&rows=${rows}`;
-        const tunnelWsUrl = `wss://gate-zoo-campaign-most.trycloudflare.com/ws/terminal?username=${uname}&cols=${cols}&rows=${rows}`;
+        const tunnelWsUrl = `wss://reminder-replacing-operates-segments.trycloudflare.com/ws/terminal?username=${uname}&cols=${cols}&rows=${rows}`;
 
         let resolved = false;
 

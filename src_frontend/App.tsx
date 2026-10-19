@@ -1090,19 +1090,21 @@ export default function App() {
             />
           )}
 
-          {activeTab === 'terminal' && activeCompany && user && (
-            <SharedTerminalView
-              user={user}
-              company={activeCompany}
-              teams={teams}
-              chatMessages={chatMessages}
-              assets={assets}
-              websocket={websocket}
-              onSaveAsset={handleSaveAsset}
-              onDeleteAsset={handleDeleteAsset}
-              onNavigateTab={handleNavigateTab}
-              initialPath={terminalInitialPath}
-            />
+          {activeCompany && user && (
+            <div className={`h-full w-full flex-col ${activeTab === 'terminal' ? 'flex' : 'hidden'}`}>
+              <SharedTerminalView
+                user={user}
+                company={activeCompany}
+                teams={teams}
+                chatMessages={chatMessages}
+                assets={assets}
+                websocket={websocket}
+                onSaveAsset={handleSaveAsset}
+                onDeleteAsset={handleDeleteAsset}
+                onNavigateTab={handleNavigateTab}
+                initialPath={terminalInitialPath}
+              />
+            </div>
           )}
 
           {activeTab === 'tasks' && activeCompany && user && (

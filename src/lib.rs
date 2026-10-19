@@ -885,6 +885,26 @@ async fn save_chat_msg_handler(
         Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "message": e.to_string()}))),
     };
 
+    // Real-time disk persistence to /workspace/chats/<channel>.log
+    let workspace_chats = if std::path::Path::new("/workspace/chats").exists() {
+        "/workspace/chats".to_string()
+    } else {
+        std::env::current_dir()
+            .map(|p| p.join("workspace/chats").to_string_lossy().to_string())
+            .unwrap_or_else(|_| "/tmp/theysynced/workspace/chats".to_string())
+    };
+    let _ = std::fs::create_dir_all(&workspace_chats);
+
+    let clean_channel = payload.channel_id.to_lowercase().chars().map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect::<String>();
+    let clean_channel = if clean_channel.is_empty() { "general".to_string() } else { clean_channel };
+
+    let log_path = format!("{}/{}.log", workspace_chats, clean_channel);
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+        let ts = saved.timestamp.replace('T', " ").chars().take(19).collect::<String>();
+        let _ = writeln!(f, "[{}] <{}> {}", ts, saved.username, saved.message);
+    }
+
     // If an active websocket session exists for this company, broadcast the message
     if let Some(session_entry) = state.sessions.get(&company_id) {
         let session = session_entry.value();
