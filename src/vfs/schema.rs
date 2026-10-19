@@ -188,3 +188,11 @@ impl VfsError {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VfsExportFile {
+    pub path: String,
+    pub kind: String,
+    pub mode: u32,
+    pub content: String,
+}
+

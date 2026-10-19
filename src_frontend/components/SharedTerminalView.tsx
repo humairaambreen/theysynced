@@ -2,8 +2,8 @@
 
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Company, Team, ChatMessage, UserProfile, WorkspaceAsset, ActiveTab } from '../types';
-import { Terminal as TerminalIcon, RotateCcw, Power, ShieldCheck, Check } from 'lucide-react';
-import { buildCompanyLinuxFilesystem } from '../lib/linuxFilesystem';
+import { Terminal as TerminalIcon, RotateCcw } from 'lucide-react';
+import { VfsClient, VfsEvent } from '../lib/linuxFilesystem';
 import 'xterm/css/xterm.css';
 
 interface SharedTerminalViewProps {
@@ -17,6 +17,19 @@ interface SharedTerminalViewProps {
   onDeleteAsset: (assetId: string) => Promise<void>;
   onNavigateTab?: (tab: ActiveTab, subItem?: string) => void;
   initialPath?: string;
+  token?: string;
+}
+
+interface TerminalConfig {
+  mode: 'mode_a' | 'mode_b';
+  container_runtime_available: boolean;
+  active_mode: 'mode_a' | 'mode_b';
+  kernel_url: string;
+  wasm_url: string;
+  bios_url: string;
+  vga_bios_url: string;
+  arch_snapshot_usable: boolean;
+  explanation: string;
 }
 
 // Dynamically load browser-safe v86 WebAssembly emulator script
@@ -42,6 +55,37 @@ function loadV86Script(): Promise<any> {
   });
 }
 
+function ensureFs9pDir(fs9p: any, path: string): number {
+  const parts = path.replace(/^\/+|\/+$/g, '').split('/').filter(Boolean);
+  let currentId = 0;
+  for (const part of parts) {
+    let childId = fs9p.Search(currentId, part);
+    if (childId === -1) {
+      childId = fs9p.CreateDirectory(part, currentId);
+    }
+    currentId = childId;
+  }
+  return currentId;
+}
+
+async function writeFs9pFile(fs9p: any, filePath: string, content: string | Uint8Array) {
+  const cleanPath = filePath.replace(/^\/+/, '');
+  const lastSlash = cleanPath.lastIndexOf('/');
+  let parentId = 0;
+  let filename = cleanPath;
+  if (lastSlash !== -1) {
+    const dir = cleanPath.substring(0, lastSlash);
+    filename = cleanPath.substring(lastSlash + 1);
+    parentId = ensureFs9pDir(fs9p, dir);
+  }
+  const existing = fs9p.Search(parentId, filename);
+  if (existing !== -1) {
+    fs9p.Unlink(parentId, filename);
+  }
+  const bytes = typeof content === 'string' ? new TextEncoder().encode(content) : content;
+  await fs9p.CreateBinaryFile(filename, parentId, bytes);
+}
+
 export const SharedTerminalView: React.FC<SharedTerminalViewProps> = ({
   user,
   company,
@@ -53,17 +97,23 @@ export const SharedTerminalView: React.FC<SharedTerminalViewProps> = ({
   onDeleteAsset,
   onNavigateTab,
   initialPath = '/workspace',
+  token,
 }) => {
   const terminalRef = useRef<HTMLDivElement>(null);
   const xtermInstance = useRef<any>(null);
   const fitAddonRef = useRef<any>(null);
 
-  const [engineStatus, setEngineStatus] = useState<string>('Connecting to Real Linux PTY...');
+  const [engineStatus, setEngineStatus] = useState<string>('Initializing Terminal...');
   const [isLive, setIsLive] = useState<boolean>(false);
 
   const ptyWsRef = useRef<WebSocket | null>(null);
   const v86InstanceRef = useRef<any>(null);
   const activeModeRef = useRef<'pty' | 'wasm' | 'none'>('none');
+  const vfsClientRef = useRef<VfsClient | null>(null);
+
+  const sessionToken = useMemo(() => {
+    return token || (typeof window !== 'undefined' ? localStorage.getItem('theysynced_token') || '' : '');
+  }, [token]);
 
   const hostname = useMemo(() => {
     const slug = (company.name || 'theysynced')
@@ -71,12 +121,14 @@ export const SharedTerminalView: React.FC<SharedTerminalViewProps> = ({
       .replace(/[^a-z0-9]/g, '-')
       .replace(/-+/g, '-')
       .replace(/^-|-$/g, '') || 'theysynced';
-    return `arch-${slug}`;
+    return `theysynced-${slug}`;
   }, [company.name]);
 
-  const { entries: linuxEntries } = useMemo(() => {
-    return buildCompanyLinuxFilesystem(company, teams, chatMessages, assets, user);
-  }, [company, teams, chatMessages, assets, user]);
+  useEffect(() => {
+    if (sessionToken && company.id) {
+      vfsClientRef.current = new VfsClient(sessionToken, company.id);
+    }
+  }, [sessionToken, company.id]);
 
   // Boot Real WebAssembly Linux Kernel (Linux 5.6.15 Buildroot)
   const bootWasmKernel = async (term: any) => {
@@ -84,7 +136,8 @@ export const SharedTerminalView: React.FC<SharedTerminalViewProps> = ({
       setEngineStatus('Booting Real Linux Kernel in WASM (v5.6.15)...');
       term.writeln('\x1b[1;36mInitializing Real Linux x86 WebAssembly Emulator (v86)...\x1b[0m');
       term.writeln('Kernel: \x1b[33mLinux 5.6.15-buildroot\x1b[0m | Console: \x1b[32m/dev/ttyS0\x1b[0m');
-      term.writeln('Streaming kernel binary (4.9MB) and starting emulator...\r\n');
+      term.writeln('Userland: \x1b[32mBusyBox v1.31.1\x1b[0m | Mode: \x1b[36mBrowser Sandbox (Mode A)\x1b[0m');
+      term.writeln('Mounting company VFS files with verified session permissions via virtio-9p...\r\n');
 
       const V86Class = await loadV86Script();
 
@@ -100,12 +153,25 @@ export const SharedTerminalView: React.FC<SharedTerminalViewProps> = ({
         } catch (_) {}
       }
 
+      // Fetch verified VFS file projection from server
+      let exportedFiles: Array<{ path: string; kind: string; mode: number; content: string }> = [];
+      try {
+        const resp = await fetch(`/api/vfs/export-tree?token=${encodeURIComponent(sessionToken)}&company_id=${encodeURIComponent(company.id)}`);
+        const json = await resp.json();
+        if (json.success && Array.isArray(json.files)) {
+          exportedFiles = json.files;
+        }
+      } catch (err: any) {
+        term.writeln(`\x1b[33mWarning: Failed to fetch VFS files: ${err.message}. Initializing empty workspace.\x1b[0m\r\n`);
+      }
+
       const emulator = new V86Class({
         wasm_path: '/v86/v86.wasm',
         memory_size: 64 * 1024 * 1024,
         bios: { url: '/v86/seabios.bin' },
         vga_bios: { url: '/v86/vgabios.bin' },
         bzimage: { url: '/v86/buildroot-bzimage.bin' },
+        filesystem: {},
         cmdline: 'console=ttyS0 root=/dev/ram0 rw quiet',
         autostart: true,
       });
@@ -113,74 +179,69 @@ export const SharedTerminalView: React.FC<SharedTerminalViewProps> = ({
       v86InstanceRef.current = emulator;
       activeModeRef.current = 'wasm';
       setIsLive(true);
-      setEngineStatus('Real Linux Kernel 5.6.15 (WASM)');
+      setEngineStatus('Real Linux Kernel 5.6.15 (WASM v86)');
 
       // Stream serial output bytes directly from Linux kernel to xterm.js
       emulator.add_listener('serial0-output-byte', (byte: number) => {
         term.write(String.fromCharCode(byte));
       });
 
-      // Initialize connected /workspace folders, files, chats, and prompt once shell boots
+      // Populate fs9p tree before mounting in guest
+      if (emulator.fs9p) {
+        ensureFs9pDir(emulator.fs9p, 'workspace');
+        for (const file of exportedFiles) {
+          const relPath = file.path.replace(/^\/+/, '');
+          await writeFs9pFile(emulator.fs9p, `workspace/${relPath}`, file.content);
+        }
+
+        // Hook fs9p write notifications to sync back to VFS server
+        const originalNotify = emulator.fs9p.NotifyListeners ? emulator.fs9p.NotifyListeners.bind(emulator.fs9p) : null;
+        emulator.fs9p.NotifyListeners = async (inodeId: number, op: string, details?: any) => {
+          if (originalNotify) originalNotify(inodeId, op, details);
+          if ((op === 'write' || op === 'newfile') && vfsClientRef.current) {
+            try {
+              const fullPath = emulator.fs9p.GetFullPath(inodeId);
+              if (fullPath && fullPath.startsWith('/workspace/')) {
+                const inode = emulator.fs9p.GetInode(inodeId);
+                if (inode && !emulator.fs9p.IsDirectory(inodeId)) {
+                  const data = await emulator.fs9p.Read(inodeId, 0, inode.size);
+                  const content = new TextDecoder().decode(data);
+                  const vfsPath = fullPath.replace(/^\/workspace/, '');
+                  await vfsClientRef.current.write(vfsPath, content);
+                }
+              }
+            } catch (_) {}
+          }
+        };
+      }
+
+      // Initialize guest shell once kernel finishes uncompressing
       let initialized = false;
-      const initWorkspace = () => {
+      const initGuestWorkspace = () => {
         if (initialized || !v86InstanceRef.current) return;
         initialized = true;
 
-        const cleanUser = user?.username || 'user';
+        const cleanUser = (user?.username || 'user').replace(/[^a-zA-Z0-9_-]/g, '');
         const cmds: string[] = [
-          'mkdir -p /workspace/chats /workspace/docs /workspace/spreadsheets /workspace/drawings /workspace/tasks /workspace/files /workspace/export /home/' + cleanUser,
+          'mkdir -p /workspace',
+          'mount -t 9p -o trans=virtio host9p /workspace 2>/dev/null || mount -t 9p host9p /workspace 2>/dev/null',
+          'cd /workspace',
+          `export PS1='[${cleanUser}@${hostname} \\W]\\$ '`,
+          'clear',
+          'echo "======================================================================="',
+          'echo "  TheySynced Work OS - Browser WebAssembly Linux Kernel (v86)"',
+          'echo "  Kernel: Linux 5.6.15-buildroot (i386) | Console: /dev/ttyS0"',
+          'echo "  Environment: Minimal embedded Linux with BusyBox & wget."',
+          'echo "  Package Manager Note: Minimal BusyBox Linux. For pacman/apt, use Mode B."',
+          `echo "  Organization: ${company.name} | Mounted at /workspace via virtio-9p"`,
+          'echo "======================================================================="',
+          'ls -la',
         ];
-
-        // Populate every single workspace asset (including chat logs and JSON)
-        for (const entry of linuxEntries) {
-          if (entry.type === 'file' && entry.content) {
-            const dir = entry.path.substring(0, entry.path.lastIndexOf('/'));
-            const b64 = btoa(unescape(encodeURIComponent(entry.content)));
-            cmds.push(`mkdir -p "${dir}" && echo "${b64}" | base64 -d > "${entry.path}"`);
-          }
-        }
-
-        // Install friendly package manager and shell environment
-        cmds.push(`cat << 'PAC_EOF' > /bin/pacman
-#!/bin/sh
-case "$1" in
-  -S|-Sy|-Syu)
-    pkg="$2"
-    echo "resolving dependencies..."
-    echo "looking for conflicting packages..."
-    echo "Packages (1) $pkg-latest-x86_64"
-    echo ":: Proceed with installation? [Y/n] y"
-    echo "(1/1) installing $pkg [####################################] 100%"
-    echo "✓ $pkg installed successfully into /usr/bin/$pkg"
-    cat << 'SUB_EOF' > "/usr/bin/$pkg"
-#!/bin/sh
-echo "[$pkg: executed successfully in /workspace]"
-SUB_EOF
-    chmod +x "/usr/bin/$pkg"
-    ;;
-  *)
-    echo "pacman v6.10 (TheySynced Arch Work OS)"
-    ;;
-esac
-PAC_EOF
-chmod +x /bin/pacman
-ln -sf /bin/pacman /bin/apt 2>/dev/null
-ln -sf /bin/pacman /bin/apk 2>/dev/null
-`);
-
-        cmds.push(`export PS1='[${cleanUser}@${hostname} \\W]\\$ '`);
-        cmds.push('cd /workspace');
-        cmds.push('clear');
-        cmds.push('echo "======================================================================="');
-        cmds.push('echo "  TheySynced Real Linux Work OS (v6.10 Arch-Compatible)"');
-        cmds.push(`echo "  Organization: ${company.name} | Mounted at /workspace"`);
-        cmds.push('echo "======================================================================="');
-        cmds.push('ls -la');
 
         v86InstanceRef.current.serial0_send(cmds.join('\n') + '\n');
       };
 
-      setTimeout(initWorkspace, 3200);
+      setTimeout(initGuestWorkspace, 3400);
 
       term.writeln('\x1b[32m✓ Real Linux Kernel running directly in WebAssembly.\x1b[0m\r\n');
     } catch (err: any) {
@@ -189,129 +250,68 @@ ln -sf /bin/pacman /bin/apk 2>/dev/null
     }
   };
 
-  // Synchronize new chat messages into /workspace/chats/ in real time
-  useEffect(() => {
-    if (!chatMessages || chatMessages.length === 0) return;
-    if (activeModeRef.current === 'wasm' && v86InstanceRef.current) {
-      const activeTeamsList = teams.length > 0 ? teams : [
-        { id: `team_${company.id}_gen`, company_id: company.id, name: 'General', created_at: new Date().toISOString() }
-      ];
-      activeTeamsList.forEach((t) => {
-        const cleanName = t.name.toLowerCase().replace(/[^a-z0-9_-]/g, '_');
-        const msgs = chatMessages.filter(m => m.team_id === t.id || (!m.team_id && cleanName === 'general'));
-        if (msgs.length > 0) {
-          const logLines = msgs.map(m => {
-            const ts = m.timestamp ? new Date(m.timestamp).toISOString().replace('T', ' ').substring(0, 19) : '';
-            return `[${ts}] <${m.username}> ${m.message}`;
-          });
-          const logContent = `# TheySynced Chat Log: #${t.name}\n# Total Messages: ${msgs.length}\n\n` + logLines.join('\n') + '\n';
-          const b64 = btoa(unescape(encodeURIComponent(logContent)));
-          const jsonB64 = btoa(unescape(encodeURIComponent(JSON.stringify(msgs, null, 2))));
-
-          try {
-            v86InstanceRef.current.serial0_send(`echo "${b64}" | base64 -d > "/workspace/chats/${cleanName}.log"\n`);
-            v86InstanceRef.current.serial0_send(`echo "${jsonB64}" | base64 -d > "/workspace/chats/${cleanName}.chat.json"\n`);
-          } catch (_) {}
-        }
-      });
-    }
-  }, [chatMessages, teams, company.id]);
-
-  // Connect to Real Rust PTY WebSocket with multi-stage tunnel failover
+  // Connect to Real Container PTY WebSocket (Mode B)
   const tryConnectPty = (term: any): Promise<boolean> => {
     return new Promise((resolve) => {
       try {
         const loc = window.location;
         let wsHost = loc.host;
-        // In local development, Next.js frontend is on 3000 while Rust backend is on 8080
         if (loc.port === '3000') {
           wsHost = `${loc.hostname}:8080`;
         }
         const wsProto = loc.protocol === 'https:' ? 'wss:' : 'ws:';
         const cols = term?.cols || 100;
         const rows = term?.rows || 30;
-        const uname = encodeURIComponent(user?.username || 'user');
 
-        const primaryWsUrl = `${wsProto}//${wsHost}/ws/terminal?username=${uname}&cols=${cols}&rows=${rows}`;
-        const envTunnel = process.env.NEXT_PUBLIC_TUNNEL_URL;
-        const tunnelWsUrl = envTunnel
-          ? `${envTunnel.replace(/^https:\/\//, 'wss://').replace(/^http:\/\//, 'ws://')}/ws/terminal?username=${uname}&cols=${cols}&rows=${rows}`
-          : '';
+        const wsUrl = `${wsProto}//${wsHost}/ws/terminal?token=${encodeURIComponent(sessionToken)}&company_id=${encodeURIComponent(company.id)}&cols=${cols}&rows=${rows}`;
+
+        const ws = new WebSocket(wsUrl);
+        ws.binaryType = 'arraybuffer';
 
         let resolved = false;
-
-        const attempt = (targetUrl: string, isFallback: boolean) => {
-          if (!targetUrl) {
+        const timeout = setTimeout(() => {
+          if (!resolved) {
+            try { ws.close(); } catch (_) {}
             resolved = true;
             resolve(false);
-            return;
           }
-          try {
-            const ws = new WebSocket(targetUrl);
-            ws.binaryType = 'arraybuffer';
+        }, 2500);
 
-            const timeout = setTimeout(() => {
-              if (!resolved) {
-                try { ws.close(); } catch (_) {}
-                if (!isFallback && tunnelWsUrl && targetUrl !== tunnelWsUrl) {
-                  attempt(tunnelWsUrl, true);
-                } else {
-                  resolved = true;
-                  resolve(false);
-                }
-              }
-            }, isFallback ? 3500 : 2200);
+        ws.onopen = () => {
+          if (resolved) return;
+          resolved = true;
+          clearTimeout(timeout);
+          ptyWsRef.current = ws;
+          activeModeRef.current = 'pty';
+          setIsLive(true);
+          setEngineStatus('Real Linux Container PTY (Native Mode B)');
+          term.writeln('\x1b[1;32m✓ Connected to Native Linux Container Session (Mode B)\x1b[0m');
+          term.writeln(`Host: \x1b[1;36m${hostname}\x1b[0m | User: \x1b[1;33m${user.username}\x1b[0m | Sandboxed Container\r\n`);
+          resolve(true);
+        };
 
-            ws.onopen = () => {
-              if (resolved) return;
-              resolved = true;
-              clearTimeout(timeout);
-              ptyWsRef.current = ws;
-              activeModeRef.current = 'pty';
-              setIsLive(true);
-              setEngineStatus('Real Linux Container PTY (Native)');
-              term.writeln('\x1b[1;32m✓ Connected to Native Linux / POSIX PTY Session\x1b[0m');
-              term.writeln(`Host: \x1b[1;36m${hostname}\x1b[0m | User: \x1b[1;33m${user.username}\x1b[0m | Full Native Process Execution\r\n`);
-              resolve(true);
-            };
-
-            ws.onmessage = (event) => {
-              if (event.data instanceof ArrayBuffer) {
-                term.write(new Uint8Array(event.data));
-              } else if (typeof event.data === 'string') {
-                term.write(event.data);
-              }
-            };
-
-            ws.onerror = () => {
-              if (resolved) return;
-              clearTimeout(timeout);
-              if (!isFallback && targetUrl !== tunnelWsUrl) {
-                attempt(tunnelWsUrl, true);
-              } else {
-                resolved = true;
-                resolve(false);
-              }
-            };
-
-            ws.onclose = () => {
-              if (activeModeRef.current === 'pty') {
-                term.writeln('\r\n\x1b[33m[PTY Session Closed. Switching to Real WebAssembly Linux Kernel...]\x1b[0m\r\n');
-                activeModeRef.current = 'wasm';
-                bootWasmKernel(term);
-              }
-            };
-          } catch {
-            if (!isFallback && targetUrl !== tunnelWsUrl) {
-              attempt(tunnelWsUrl, true);
-            } else if (!resolved) {
-              resolved = true;
-              resolve(false);
-            }
+        ws.onmessage = (event) => {
+          if (event.data instanceof ArrayBuffer) {
+            term.write(new Uint8Array(event.data));
+          } else if (typeof event.data === 'string') {
+            term.write(event.data);
           }
         };
 
-        attempt(primaryWsUrl, false);
+        ws.onerror = () => {
+          if (resolved) return;
+          resolved = true;
+          clearTimeout(timeout);
+          resolve(false);
+        };
+
+        ws.onclose = () => {
+          if (activeModeRef.current === 'pty') {
+            term.writeln('\r\n\x1b[33m[Mode B container session closed. Switching to Real WebAssembly Linux Kernel...]\x1b[0m\r\n');
+            activeModeRef.current = 'wasm';
+            bootWasmKernel(term);
+          }
+        };
       } catch {
         resolve(false);
       }
@@ -322,6 +322,7 @@ ln -sf /bin/pacman /bin/apk 2>/dev/null
   useEffect(() => {
     let term: any = null;
     let fitAddon: any = null;
+    let vfsUnsub: (() => void) | null = null;
 
     const init = async () => {
       if (!terminalRef.current) return;
@@ -391,7 +392,7 @@ ln -sf /bin/pacman /bin/apk 2>/dev/null
         return true;
       });
 
-      // Forward keyboard input directly to the active real engine
+      // Forward keyboard input directly to the active engine
       term.onData((data: string) => {
         if (activeModeRef.current === 'pty' && ptyWsRef.current?.readyState === WebSocket.OPEN) {
           ptyWsRef.current.send(data);
@@ -400,19 +401,42 @@ ln -sf /bin/pacman /bin/apk 2>/dev/null
         }
       });
 
-      // Synchronize terminal dimensions with native PTY master on dynamic resize
-      term.onResize(({ cols, rows }: { cols: number; rows: number }) => {
-        if (activeModeRef.current === 'pty' && ptyWsRef.current?.readyState === WebSocket.OPEN) {
-          ptyWsRef.current.send(JSON.stringify({ type: 'resize', cols, rows }));
+      // Check server terminal configuration
+      let config: TerminalConfig | null = null;
+      try {
+        const res = await fetch('/api/terminal/config');
+        if (res.ok) {
+          config = await res.json();
         }
-      });
+      } catch (_) {}
 
-      // Step 1: Try native Rust PTY WebSocket (0ms native processes, pacman, apt, fish)
-      const ptyConnected = await tryConnectPty(term);
-
-      // Step 2: Fall back to real WebAssembly Linux Kernel if PTY is not hosted
-      if (!ptyConnected) {
+      // If Mode B is active on server, try container WebSocket
+      if (config?.active_mode === 'mode_b') {
+        const ptyConnected = await tryConnectPty(term);
+        if (!ptyConnected) {
+          term.writeln('\x1b[33m[Mode B container runtime unavailable. Falling back to Mode A (v86 WebAssembly Linux)...]\x1b[0m\r\n');
+          await bootWasmKernel(term);
+        }
+      } else {
+        // Mode A (default)
         await bootWasmKernel(term);
+      }
+
+      // Connect to VFS WebSocket for real-time live synchronization
+      if (vfsClientRef.current) {
+        vfsUnsub = vfsClientRef.current.connectWs(async (event: VfsEvent) => {
+          if (activeModeRef.current === 'wasm' && v86InstanceRef.current?.fs9p && vfsClientRef.current) {
+            if (event.op === 'write' || event.op === 'create' || event.op === 'message') {
+              try {
+                if (event.path) {
+                  const content = await vfsClientRef.current.read(event.path);
+                  const relPath = event.path.replace(/^\/+/, '');
+                  await writeFs9pFile(v86InstanceRef.current.fs9p, `workspace/${relPath}`, content);
+                }
+              } catch (_) {}
+            }
+          }
+        });
       }
     };
 
@@ -421,13 +445,6 @@ ln -sf /bin/pacman /bin/apk 2>/dev/null
     const handleResize = () => {
       try {
         fitAddonRef.current?.fit();
-        if (activeModeRef.current === 'pty' && ptyWsRef.current?.readyState === WebSocket.OPEN && xtermInstance.current) {
-          ptyWsRef.current.send(JSON.stringify({
-            type: 'resize',
-            cols: xtermInstance.current.cols,
-            rows: xtermInstance.current.rows,
-          }));
-        }
       } catch (_) {}
     };
 
@@ -435,6 +452,7 @@ ln -sf /bin/pacman /bin/apk 2>/dev/null
 
     return () => {
       window.removeEventListener('resize', handleResize);
+      if (vfsUnsub) vfsUnsub();
       if (ptyWsRef.current) {
         ptyWsRef.current.close();
         ptyWsRef.current = null;
@@ -451,7 +469,7 @@ ln -sf /bin/pacman /bin/apk 2>/dev/null
         } catch (_) {}
       }
     };
-  }, []);
+  }, [sessionToken, company.id]);
 
   const handleRestart = () => {
     if (xtermInstance.current) {

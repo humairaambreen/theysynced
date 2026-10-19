@@ -648,6 +648,22 @@ async fn handle_vfs_socket(socket: WebSocket, state: AppState, cred: Cred) {
     state.vfs_hub.unsubscribe(&sub_id);
 }
 
+pub async fn vfs_export_tree_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<VfsQuery>,
+) -> impl IntoResponse {
+    let (cred, _) = match authenticate_cred(&state.db, &headers, q.token.as_deref(), q.company_id.as_deref()).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+
+    match state.db.vfs.export_tree(&cred).await {
+        Ok(files) => (StatusCode::OK, Json(serde_json::json!({ "success": true, "files": files }))).into_response(),
+        Err(e) => vfs_err_resp(e).into_response(),
+    }
+}
+
 // ── Router Registration ───────────────────────────────────────────────────────
 
 pub fn vfs_routes() -> Router<AppState> {
@@ -671,5 +687,6 @@ pub fn vfs_routes() -> Router<AppState> {
         .route("/api/vfs/message/append", post(vfs_append_message_handler))
         .route("/api/vfs/message/list", get(vfs_read_messages_handler))
         .route("/api/vfs/dm/open", post(vfs_open_dm_handler))
+        .route("/api/vfs/export-tree", get(vfs_export_tree_handler))
         .route("/ws/vfs", get(vfs_websocket_handler))
 }

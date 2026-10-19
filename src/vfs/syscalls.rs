@@ -6,7 +6,7 @@ use chrono::Utc;
 use crate::crypto;
 use super::perms::{can_exec, can_read, can_write};
 use super::path::{normalize_path, split_parent_child, split_path};
-use super::schema::{Cred, InodeKind, VfsAcl, VfsInode, VfsMessage, VfsError};
+use super::schema::{Cred, InodeKind, VfsAcl, VfsError, VfsExportFile, VfsInode, VfsMessage};
 
 #[derive(Clone)]
 pub struct VfsEngine {
@@ -1181,5 +1181,62 @@ impl VfsEngine {
 
         self.write_audit(&cred.company_id, &cred.uid, "read_messages", Some(&inode.id), true, Some(&format!("count: {}", messages.len()))).await;
         Ok(messages)
+    }
+
+    /// Recursively exports all accessible VFS files for the session user `cred`.
+    /// Ancestor directories are checked for execute/search permissions (`can_exec`),
+    /// and every non-directory node is checked for read permissions (`can_read`).
+    /// Inaccessible nodes (such as sealed DMs between other users) are completely omitted.
+    pub async fn export_tree(&self, cred: &Cred) -> Result<Vec<VfsExportFile>, VfsError> {
+        let root = self.get_root_inode(&cred.company_id).await?;
+        let root_acl = self.get_acl(&cred.company_id, &root.id, &cred.uid).await.unwrap_or(None);
+        if !can_exec(cred, &root, root_acl.as_ref()) {
+            return Err(VfsError::EACCES);
+        }
+
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(("/".to_string(), root.id.clone()));
+
+        let mut export_files = Vec::new();
+
+        while let Some((dir_path, dir_id)) = queue.pop_front() {
+            let mut rows = self.turso.query(
+                "SELECT company_id, id, parent_id, name, kind, owner, gid, mode, sealed, size, mtime, ctime, blob_ref, meta_json
+                 FROM vfs_inodes WHERE company_id = ? AND parent_id = ? ORDER BY name ASC",
+                libsql::params![cred.company_id.clone(), dir_id],
+            ).await.map_err(|e| VfsError::EIO(e.to_string()))?;
+
+            while let Some(row) = rows.next().await.map_err(|e| VfsError::EIO(e.to_string()))? {
+                let inode = Self::row_to_inode(&row)?;
+                let acl = self.get_acl(&cred.company_id, &inode.id, &cred.uid).await.unwrap_or(None);
+                let full_path = if dir_path == "/" {
+                    format!("/{}", inode.name)
+                } else {
+                    format!("{}/{}", dir_path, inode.name)
+                };
+
+                if inode.kind == InodeKind::Dir {
+                    if can_exec(cred, &inode, acl.as_ref()) {
+                        queue.push_back((full_path, inode.id));
+                    }
+                } else {
+                    // Check if the user is authorized to read this node
+                    if can_read(cred, &inode, acl.as_ref()) {
+                        if let Ok(bytes) = self.read(cred, &full_path).await {
+                            let content = String::from_utf8_lossy(&bytes).to_string();
+                            export_files.push(VfsExportFile {
+                                path: full_path,
+                                kind: inode.kind.as_str().to_string(),
+                                mode: inode.mode,
+                                content,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        self.write_audit(&cred.company_id, &cred.uid, "export_tree", None, true, Some(&format!("exported {} files", export_files.len()))).await;
+        Ok(export_files)
     }
 }

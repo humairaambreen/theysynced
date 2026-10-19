@@ -200,10 +200,17 @@ export class VfsClient {
   }
 
   async read(path: string): Promise<string> {
-    const data = await this.request<{ success: boolean; data: string; size: number }>(
-      `/api/vfs/read?token=${encodeURIComponent(this.token)}&company_id=${encodeURIComponent(this.companyId)}&path=${encodeURIComponent(path)}`
-    );
-    return data.data;
+    const origin = typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000';
+    const url = new URL(`${this.baseUrl}/api/vfs/read?token=${encodeURIComponent(this.token)}&company_id=${encodeURIComponent(this.companyId)}&path=${encodeURIComponent(path)}`, origin);
+    const headers: Record<string, string> = {};
+    if (this.token) {
+      headers['Authorization'] = `Bearer ${this.token}`;
+    }
+    const res = await fetch(url.toString(), { headers });
+    if (!res.ok) {
+      throw new Error(`Failed to read VFS path ${path}: status ${res.status}`);
+    }
+    return await res.text();
   }
 
   async write(path: string, content: string): Promise<void> {
@@ -213,7 +220,7 @@ export class VfsClient {
         token: this.token,
         company_id: this.companyId,
         path,
-        data: content,
+        content,
       }),
     });
   }

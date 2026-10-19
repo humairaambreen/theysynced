@@ -1107,6 +1107,7 @@ export default function App() {
                 onDeleteAsset={handleDeleteAsset}
                 onNavigateTab={handleNavigateTab}
                 initialPath={terminalInitialPath}
+                token={token || undefined}
               />
             </div>
           )}

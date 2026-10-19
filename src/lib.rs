@@ -21,6 +21,7 @@ pub mod openapi;
 pub mod crypto;
 pub mod ssrf;
 pub mod vfs;
+pub mod terminal;
 
 pub fn extract_token(headers: &axum::http::HeaderMap, query_or_body_token: Option<&str>) -> Option<String> {
     if let Some(auth) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
@@ -143,7 +144,8 @@ pub fn create_app(state: AppState) -> Router {
         // Realtime WebSockets Hub
         .route("/ws/:session_id", get(websocket_handler))
         .route("/rdp-ws", get(rdp_websocket_handler))
-        .route("/ws/terminal", get(terminal_pty_ws_handler))
+        .route("/api/terminal/config", get(terminal::terminal_config_handler))
+        .route("/ws/terminal", get(terminal::terminal_ws_handler))
         .route("/api/browser/proxy", get(browser_proxy_handler))
 
         // Storage / Media API (Cloudflare R2 & Local fallback)
@@ -1270,14 +1272,7 @@ async fn handle_rdp_websocket(client_socket: WebSocket) {
     }
 }
 
-// Direct host PTY terminal is disabled for security until Phase 4 isolated sandbox replaces it
-async fn terminal_pty_ws_handler() -> impl IntoResponse {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        [(header::CONTENT_TYPE, "text/plain".to_string())],
-        "503 Service Unavailable: Direct host terminal PTY is disabled for security. Sandboxed per-company environments will be provisioned in Phase 4.".to_string(),
-    )
-}
+
 
 #[derive(Deserialize)]
 struct BrowserProxyQuery {
