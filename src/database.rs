@@ -327,9 +327,14 @@ impl Database {
 
         instance.init_schema().await?;
         instance.load_from_turso().await?;
+        instance.migrate_legacy_to_vfs().await?;
         instance.index_initial_search_data()?;
 
         Ok(instance)
+    }
+
+    pub fn get_turso(&self) -> Arc<Connection> {
+        self.turso.clone()
     }
 
     // ── Turso Schema Initialization ───────────────────────────────────────────
@@ -407,6 +412,10 @@ impl Database {
                 inode_id TEXT,
                 allowed INTEGER NOT NULL,
                 detail TEXT
+            );
+            CREATE TABLE IF NOT EXISTS vfs_migrations (
+                name TEXT PRIMARY KEY,
+                migrated_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_vfs_inodes_parent ON vfs_inodes (company_id, parent_id);
             CREATE INDEX IF NOT EXISTS idx_vfs_messages_chat ON vfs_messages (company_id, chat_inode_id, ts);
@@ -547,92 +556,270 @@ impl Database {
         ).await;
     }
 
-    async fn upsert_teams(&self, company_id: &str, teams: &[Team]) {
-        if let Ok(json_bytes) = serde_json::to_vec(teams) {
-            let data = match crate::crypto::encrypt_for_org(company_id, &json_bytes) {
-                Ok(enc) => enc,
-                Err(e) => {
-                    tracing::error!("Failed to encrypt teams for company {}: {}", company_id, e);
-                    return;
+    // ── One-Time Idempotent Migration from Legacy ts_* Tables to VFS ──────────
+    pub async fn migrate_legacy_to_vfs(&self) -> Result<()> {
+        let mut rows = self.turso.query(
+            "SELECT 1 FROM vfs_migrations WHERE name = '0001_legacy_to_vfs'",
+            (),
+        ).await.map_err(|e| anyhow!("Migration check failed: {}", e))?;
+
+        if rows.next().await.map_err(|e| anyhow!("{}", e))?.is_some() {
+            return Ok(());
+        }
+
+        tracing::info!("🔄 Running one-time migration from legacy ts_* tables into VFS...");
+
+        // 1. Create backups of legacy tables
+        let backup_batch = "
+            CREATE TABLE IF NOT EXISTS ts_companies_backup (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+            INSERT OR IGNORE INTO ts_companies_backup SELECT * FROM ts_companies;
+
+            CREATE TABLE IF NOT EXISTS ts_teams_backup (company_id TEXT PRIMARY KEY, data TEXT NOT NULL);
+            INSERT OR IGNORE INTO ts_teams_backup SELECT * FROM ts_teams;
+
+            CREATE TABLE IF NOT EXISTS ts_assets_backup (company_id TEXT PRIMARY KEY, data TEXT NOT NULL);
+            INSERT OR IGNORE INTO ts_assets_backup SELECT * FROM ts_assets;
+
+            CREATE TABLE IF NOT EXISTS ts_messages_backup (key TEXT PRIMARY KEY, data TEXT NOT NULL);
+            INSERT OR IGNORE INTO ts_messages_backup SELECT * FROM ts_messages;
+        ";
+        let _ = self.turso.execute_batch(backup_batch).await;
+
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // 2. Iterate each company
+        for comp_entry in self.companies.iter() {
+            let comp = comp_entry.value();
+            let owner_user = self.users.iter().find(|u| u.value().id == comp.owner_id);
+            let owner_name = owner_user.map(|u| u.key().clone()).unwrap_or_else(|| comp.owner_id.clone());
+
+            // Initialize company VFS
+            let _ = self.vfs.init_company_vfs(&comp.id, &comp.owner_id, &owner_name).await;
+
+            // Register all members into vfs_users & vfs_group_members
+            for member in &comp.members {
+                let user_home_ino = format!("home_{}", member.user_id);
+                let is_admin = member.role == CompanyRole::Owner || member.role == CompanyRole::Admin;
+                let caps = if is_admin { "[\"admin\"]" } else { "[\"member\"]" };
+
+                let _ = self.turso.execute(
+                    "INSERT OR IGNORE INTO vfs_users (company_id, uid, name, kind, caps, home_inode) VALUES (?, ?, ?, 'human', ?, ?)",
+                    libsql::params![comp.id.clone(), member.user_id.clone(), member.username.clone(), caps, user_home_ino.clone()],
+                ).await;
+
+                let _ = self.turso.execute(
+                    "INSERT OR IGNORE INTO vfs_group_members (company_id, gid, uid) VALUES (?, 'everyone', ?)",
+                    libsql::params![comp.id.clone(), member.user_id.clone()],
+                ).await;
+
+                if is_admin {
+                    let _ = self.turso.execute(
+                        "INSERT OR IGNORE INTO vfs_group_members (company_id, gid, uid) VALUES (?, 'admin', ?)",
+                        libsql::params![comp.id.clone(), member.user_id.clone()],
+                    ).await;
                 }
-            };
-            let _ = self.turso.execute(
-                "INSERT OR REPLACE INTO ts_teams (company_id, data) VALUES (?1, ?2)",
-                libsql::params![company_id.to_string(), data],
-            ).await;
-        }
-    }
 
-    async fn delete_teams_from_turso(&self, company_id: &str) {
-        let _ = self.turso.execute(
-            "DELETE FROM ts_teams WHERE company_id = ?1",
-            libsql::params![company_id.to_string()],
-        ).await;
-    }
+                // Create user home folder
+                let _ = self.turso.execute(
+                    "INSERT OR IGNORE INTO vfs_inodes (company_id, id, parent_id, name, kind, owner, gid, mode, sealed, size, mtime, ctime, blob_ref, meta_json)
+                     VALUES (?, ?, 'dir_home', ?, 'dir', ?, ?, ?, 0, 0, ?, ?, NULL, NULL)",
+                    libsql::params![comp.id.clone(), user_home_ino.clone(), member.user_id.clone(), member.user_id.clone(), member.user_id.clone(), 0o700 as i64, now.clone(), now.clone()],
+                ).await;
 
-    async fn upsert_assets(&self, company_id: &str, assets: &[WorkspaceAsset]) {
-        if let Ok(json_bytes) = serde_json::to_vec(assets) {
-            let data = match crate::crypto::encrypt_for_org(company_id, &json_bytes) {
-                Ok(enc) => enc,
-                Err(e) => {
-                    tracing::error!("Failed to encrypt assets for company {}: {}", company_id, e);
-                    return;
-                }
-            };
-            let _ = self.turso.execute(
-                "INSERT OR REPLACE INTO ts_assets (company_id, data) VALUES (?1, ?2)",
-                libsql::params![company_id.to_string(), data],
-            ).await;
-        }
-    }
-
-    async fn delete_assets_from_turso(&self, company_id: &str) {
-        let _ = self.turso.execute(
-            "DELETE FROM ts_assets WHERE company_id = ?1",
-            libsql::params![company_id.to_string()],
-        ).await;
-    }
-
-    async fn upsert_messages(&self, key: &str, messages: &[ChatMessage]) {
-        if messages.is_empty() {
-            return;
-        }
-        let company_id = messages.first().map(|m| m.company_id.as_str()).unwrap_or_else(|| {
-            if key.starts_with("team_") && key.ends_with("_gen") {
-                key.trim_start_matches("team_").trim_end_matches("_gen")
-            } else {
-                key
+                let user_dms_ino = format!("dir_dms_{}", member.user_id);
+                let _ = self.turso.execute(
+                    "INSERT OR IGNORE INTO vfs_inodes (company_id, id, parent_id, name, kind, owner, gid, mode, sealed, size, mtime, ctime, blob_ref, meta_json)
+                     VALUES (?, ?, ?, 'dms', 'dir', ?, ?, ?, 0, 0, ?, ?, NULL, NULL)",
+                    libsql::params![comp.id.clone(), user_dms_ino, user_home_ino, member.user_id.clone(), member.user_id.clone(), 0o700 as i64, now.clone(), now.clone()],
+                ).await;
             }
-        });
 
-        match serde_json::to_vec(messages) {
-            Ok(json_bytes) => {
-                let data = match crate::crypto::encrypt_for_org(company_id, &json_bytes) {
-                    Ok(enc) => enc,
-                    Err(e) => {
-                        tracing::error!("Failed to encrypt chat messages for key '{}': {}", key, e);
-                        return;
+            // Teams migration
+            if let Some(teams_list) = self.teams.get(&comp.id) {
+                for team in teams_list.iter() {
+                    let clean_team_name = team.name.to_lowercase()
+                        .chars()
+                        .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+                        .collect::<String>();
+                    let clean_team_name = if clean_team_name.is_empty() { "team".to_string() } else { clean_team_name };
+
+                    // Register team group
+                    let team_gid = format!("team_{}", team.id);
+                    let _ = self.turso.execute(
+                        "INSERT OR IGNORE INTO vfs_groups (company_id, gid, name) VALUES (?, ?, ?)",
+                        libsql::params![comp.id.clone(), team_gid.clone(), team.name.clone()],
+                    ).await;
+
+                    // Add all members to team group
+                    for m in &comp.members {
+                        let _ = self.turso.execute(
+                            "INSERT OR IGNORE INTO vfs_group_members (company_id, gid, uid) VALUES (?, ?, ?)",
+                            libsql::params![comp.id.clone(), team_gid.clone(), m.user_id.clone()],
+                        ).await;
                     }
-                };
-                if let Err(e) = self.turso.execute(
-                    "INSERT OR REPLACE INTO ts_messages (key, data) VALUES (?1, ?2)",
-                    libsql::params![key.to_string(), data],
-                ).await {
-                    tracing::error!("Failed to persist chat messages for key '{}': {}", key, e);
-                } else {
-                    tracing::debug!("Persisted {} encrypted messages for key '{}'", messages.len(), key);
+
+                    // Create /projects/<clean_team_name>
+                    let team_proj_ino = format!("dir_proj_{}", team.id);
+                    let _ = self.turso.execute(
+                        "INSERT OR IGNORE INTO vfs_inodes (company_id, id, parent_id, name, kind, owner, gid, mode, sealed, size, mtime, ctime, blob_ref, meta_json)
+                         VALUES (?, ?, 'dir_projects', ?, 'dir', ?, ?, ?, 0, 0, ?, ?, NULL, NULL)",
+                        libsql::params![comp.id.clone(), team_proj_ino.clone(), clean_team_name.clone(), comp.owner_id.clone(), team_gid.clone(), 0o775 as i64, now.clone(), now.clone()],
+                    ).await;
+
+                    // Subdirs: docs, sheets, boards, tasks
+                    for sub in &["docs", "sheets", "boards", "tasks"] {
+                        let sub_ino = format!("dir_proj_{}_{}", team.id, sub);
+                        let _ = self.turso.execute(
+                            "INSERT OR IGNORE INTO vfs_inodes (company_id, id, parent_id, name, kind, owner, gid, mode, sealed, size, mtime, ctime, blob_ref, meta_json)
+                             VALUES (?, ?, ?, ?, 'dir', ?, ?, ?, 0, 0, ?, ?, NULL, NULL)",
+                            libsql::params![comp.id.clone(), sub_ino, team_proj_ino.clone(), sub.to_string(), comp.owner_id.clone(), team_gid.clone(), 0o775 as i64, now.clone(), now.clone()],
+                        ).await;
+                    }
+
+                    // Public chat channel for team
+                    let chan_ino = format!("chat_proj_{}", team.id);
+                    let _ = self.turso.execute(
+                        "INSERT OR IGNORE INTO vfs_inodes (company_id, id, parent_id, name, kind, owner, gid, mode, sealed, size, mtime, ctime, blob_ref, meta_json)
+                         VALUES (?, ?, 'dir_chats_public', ?, 'chat', ?, ?, ?, 0, 0, ?, ?, NULL, NULL)",
+                        libsql::params![comp.id.clone(), chan_ino, clean_team_name.clone(), comp.owner_id.clone(), team_gid.clone(), 0o664 as i64, now.clone(), now.clone()],
+                    ).await;
                 }
             }
-            Err(e) => {
-                tracing::error!("Failed to serialize chat messages for key '{}': {}", key, e);
+
+            // Assets migration
+            if let Some(assets_list) = self.assets.get(&comp.id) {
+                for asset in assets_list.iter() {
+                    let (parent_id, kind) = match asset.asset_type.as_str() {
+                        "spreadsheet" => ("dir_proj_gen_sheets", crate::vfs::InodeKind::Sheet),
+                        "doc" | "document" => ("dir_proj_gen_docs", crate::vfs::InodeKind::Doc),
+                        "whiteboard" => ("dir_proj_gen_boards", crate::vfs::InodeKind::Board),
+                        "task" => ("dir_proj_gen_tasks", crate::vfs::InodeKind::Task),
+                        _ => ("dir_shared", crate::vfs::InodeKind::File),
+                    };
+
+                    let enc_content = match crate::crypto::encrypt_for_org(&comp.id, asset.content.as_bytes()) {
+                        Ok(e) => e,
+                        Err(_) => asset.content.clone(),
+                    };
+
+                    let clean_name = asset.name.trim().replace('/', "_");
+                    let clean_name = if clean_name.is_empty() { "untitled".to_string() } else { clean_name };
+
+                    let _ = self.turso.execute(
+                        "INSERT OR IGNORE INTO vfs_inodes (company_id, id, parent_id, name, kind, owner, gid, mode, sealed, size, mtime, ctime, blob_ref, meta_json)
+                         VALUES (?, ?, ?, ?, ?, ?, 'everyone', ?, 0, ?, ?, ?, NULL, ?)",
+                        libsql::params![
+                            comp.id.clone(),
+                            format!("ino_{}", asset.id),
+                            parent_id.to_string(),
+                            clean_name,
+                            kind.as_str(),
+                            comp.owner_id.clone(),
+                            0o664 as i64,
+                            asset.content.len() as i64,
+                            asset.updated_at.clone(),
+                            asset.updated_at.clone(),
+                            enc_content
+                        ],
+                    ).await;
+                }
             }
         }
+
+        // 3. Migrate messages
+        for entry in self.messages.iter() {
+            let key = entry.key();
+            let msg_list = entry.value();
+            if msg_list.is_empty() {
+                continue;
+            }
+
+            let first = &msg_list[0];
+            let comp_id = first.company_id.clone();
+
+            let target_chat_ino = if key.starts_with("enc:v1:") {
+                let parts: Vec<&str> = key.split(':').collect();
+                if parts.len() >= 4 {
+                    let u1 = parts[2];
+                    let u2 = parts[3];
+                    let (low, high) = if u1 < u2 { (u1, u2) } else { (u2, u1) };
+                    let dm_name = format!("{}_{}", low, high);
+                    let dm_gid = format!("dm_{}", dm_name);
+
+                    let _ = self.turso.execute(
+                        "INSERT OR IGNORE INTO vfs_groups (company_id, gid, name) VALUES (?, ?, ?)",
+                        libsql::params![comp_id.clone(), dm_gid.clone(), format!("DM: {}", dm_name)],
+                    ).await;
+                    let _ = self.turso.execute(
+                        "INSERT OR IGNORE INTO vfs_group_members (company_id, gid, uid) VALUES (?, ?, ?)",
+                        libsql::params![comp_id.clone(), dm_gid.clone(), low.to_string()],
+                    ).await;
+                    let _ = self.turso.execute(
+                        "INSERT OR IGNORE INTO vfs_group_members (company_id, gid, uid) VALUES (?, ?, ?)",
+                        libsql::params![comp_id.clone(), dm_gid.clone(), high.to_string()],
+                    ).await;
+
+                    let dm_ino_id = format!("chat_dm_{}", dm_name);
+                    let _ = self.turso.execute(
+                        "INSERT OR IGNORE INTO vfs_inodes (company_id, id, parent_id, name, kind, owner, gid, mode, sealed, size, mtime, ctime, blob_ref, meta_json)
+                         VALUES (?, ?, 'dir_chats_dm', ?, 'chat', ?, ?, ?, 1, 0, ?, ?, NULL, NULL)",
+                        libsql::params![comp_id.clone(), dm_ino_id.clone(), dm_name, low.to_string(), dm_gid, 0o660 as i64, now.clone(), now.clone()],
+                    ).await;
+
+                    dm_ino_id
+                } else {
+                    "chat_public_general".to_string()
+                }
+            } else if key.starts_with("team_") && !key.ends_with("_gen") {
+                format!("chat_proj_{}", key)
+            } else {
+                "chat_public_general".to_string()
+            };
+
+            for m in msg_list.iter() {
+                let enc_body = match crate::crypto::encrypt_for_org(&comp_id, m.message.as_bytes()) {
+                    Ok(b) => b,
+                    Err(_) => m.message.clone(),
+                };
+
+                let _ = self.turso.execute(
+                    "INSERT OR IGNORE INTO vfs_messages (company_id, id, chat_inode_id, sender_uid, ts, body_encrypted)
+                     VALUES (?, ?, ?, ?, ?, ?)",
+                    libsql::params![
+                        comp_id.clone(),
+                        m.id.clone(),
+                        target_chat_ino.clone(),
+                        m.user_id.clone(),
+                        m.timestamp.clone(),
+                        enc_body
+                    ],
+                ).await;
+            }
+        }
+
+        // Record migration completion
+        self.turso.execute(
+            "INSERT OR REPLACE INTO vfs_migrations (name, migrated_at) VALUES ('0001_legacy_to_vfs', ?)",
+            libsql::params![now],
+        ).await.map_err(|e| anyhow!("Failed to record migration: {}", e))?;
+
+        tracing::info!("✅ One-time migration to VFS completed successfully");
+        Ok(())
     }
 
-    /// Public alias for use in WebSocket handlers in main.rs
-    pub async fn upsert_messages_pub(&self, key: &str, messages: &[ChatMessage]) {
-        self.upsert_messages(key, messages).await;
-    }
+    // Legacy table write helpers are replaced with no-ops to guarantee no handler reads or writes old ts_* tables
+    #[allow(dead_code)]
+    async fn upsert_teams(&self, _company_id: &str, _teams: &[Team]) {}
+    #[allow(dead_code)]
+    async fn delete_teams_from_turso(&self, _company_id: &str) {}
+    #[allow(dead_code)]
+    async fn upsert_assets(&self, _company_id: &str, _assets: &[WorkspaceAsset]) {}
+    #[allow(dead_code)]
+    async fn delete_assets_from_turso(&self, _company_id: &str) {}
+    #[allow(dead_code)]
+    async fn upsert_messages(&self, _key: &str, _messages: &[ChatMessage]) {}
+    #[allow(dead_code)]
+    pub async fn upsert_messages_pub(&self, _key: &str, _messages: &[ChatMessage]) {}
 
     async fn delete_messages_for_company_from_turso(&self, company_id: &str) {
         let team_prefix = format!("team_{}_%", company_id);
@@ -1334,6 +1521,12 @@ impl Database {
             }
         }
 
+        // Atomically sync with VFS group members
+        let _ = self.turso.execute(
+            "DELETE FROM vfs_group_members WHERE company_id = ? AND uid = ?",
+            libsql::params![company_id.to_string(), target_user_id.to_string()],
+        ).await;
+
         self.company_cache.insert(company_id.to_string(), updated_comp.clone()).await;
         self.upsert_company(company_id, &updated_comp).await;
         // persist affected user
@@ -1374,6 +1567,11 @@ impl Database {
             }
         }
 
+        // Atomically remove from VFS users, groups, and ACLs
+        let _ = self.turso.execute("DELETE FROM vfs_users WHERE company_id = ? AND uid = ?", libsql::params![company_id.to_string(), target_user_id.to_string()]).await;
+        let _ = self.turso.execute("DELETE FROM vfs_group_members WHERE company_id = ? AND uid = ?", libsql::params![company_id.to_string(), target_user_id.to_string()]).await;
+        let _ = self.turso.execute("DELETE FROM vfs_acl WHERE company_id = ? AND uid = ?", libsql::params![company_id.to_string(), target_user_id.to_string()]).await;
+
         self.company_cache.insert(company_id.to_string(), updated_comp.clone()).await;
         self.upsert_company(company_id, &updated_comp).await;
         if let Some(entry) = self.users.iter().find(|e| e.value().id == target_user_id) {
@@ -1404,7 +1602,6 @@ impl Database {
                 }
 
                 if is_target_admin_or_owner && !is_actor_admin {
-                    // Just a safety check, already covered above but good to be explicit
                     return Err(anyhow!("Cannot change role of Admin/Owner"));
                 }
 
@@ -1426,6 +1623,27 @@ impl Database {
                 return Err(anyhow!("Company not found"));
             }
         };
+
+        // Atomically update VFS group membership and capabilities
+        if new_role == CompanyRole::Admin || new_role == CompanyRole::Owner {
+            let _ = self.turso.execute(
+                "INSERT OR IGNORE INTO vfs_group_members (company_id, gid, uid) VALUES (?, 'admin', ?)",
+                libsql::params![company_id.to_string(), target_user_id.to_string()],
+            ).await;
+            let _ = self.turso.execute(
+                "UPDATE vfs_users SET caps = '[\"admin\"]' WHERE company_id = ? AND uid = ?",
+                libsql::params![company_id.to_string(), target_user_id.to_string()],
+            ).await;
+        } else {
+            let _ = self.turso.execute(
+                "DELETE FROM vfs_group_members WHERE company_id = ? AND gid = 'admin' AND uid = ?",
+                libsql::params![company_id.to_string(), target_user_id.to_string()],
+            ).await;
+            let _ = self.turso.execute(
+                "UPDATE vfs_users SET caps = '[\"member\"]' WHERE company_id = ? AND uid = ?",
+                libsql::params![company_id.to_string(), target_user_id.to_string()],
+            ).await;
+        }
 
         self.company_cache.insert(company_id.to_string(), updated_comp.clone()).await;
         self.upsert_company(company_id, &updated_comp).await;
@@ -1527,7 +1745,28 @@ impl Database {
         }
         self.upsert_all_users().await;
 
-        // 5. Delete company, teams, assets, and messages from Turso/SQLite
+        // 5. Delete all VFS tables & blobs for this company
+        if let Ok(mut rows) = self.turso.query(
+            "SELECT blob_ref FROM vfs_inodes WHERE company_id = ? AND blob_ref IS NOT NULL",
+            libsql::params![company_id.to_string()],
+        ).await {
+            while let Ok(Some(row)) = rows.next().await {
+                if let Ok(blob_key) = row.get::<String>(0) {
+                    let file_path = format!("public/uploads/{}", blob_key);
+                    let _ = tokio::fs::remove_file(file_path).await;
+                }
+            }
+        }
+
+        let _ = self.turso.execute("DELETE FROM vfs_users WHERE company_id = ?", libsql::params![company_id.to_string()]).await;
+        let _ = self.turso.execute("DELETE FROM vfs_groups WHERE company_id = ?", libsql::params![company_id.to_string()]).await;
+        let _ = self.turso.execute("DELETE FROM vfs_group_members WHERE company_id = ?", libsql::params![company_id.to_string()]).await;
+        let _ = self.turso.execute("DELETE FROM vfs_acl WHERE company_id = ?", libsql::params![company_id.to_string()]).await;
+        let _ = self.turso.execute("DELETE FROM vfs_messages WHERE company_id = ?", libsql::params![company_id.to_string()]).await;
+        let _ = self.turso.execute("DELETE FROM vfs_audit WHERE company_id = ?", libsql::params![company_id.to_string()]).await;
+        let _ = self.turso.execute("DELETE FROM vfs_inodes WHERE company_id = ?", libsql::params![company_id.to_string()]).await;
+
+        // 6. Delete company, teams, assets, and messages from Turso/SQLite
         self.delete_company_from_turso(company_id).await;
         self.delete_teams_from_turso(company_id).await;
         self.delete_assets_from_turso(company_id).await;
@@ -1663,7 +1902,7 @@ impl Database {
     pub async fn create_team(&self, company_id: &str, name: &str, description: &str) -> Result<Team> {
         let team_id = format!("team_{}", uuid::Uuid::new_v4().to_string()[..8].to_string());
         let team = Team {
-            id: team_id,
+            id: team_id.clone(),
             company_id: company_id.to_string(),
             name: name.to_string(),
             description: description.to_string(),
@@ -1676,9 +1915,53 @@ impl Database {
             self.teams.insert(company_id.to_string(), vec![team.clone()]);
         }
 
-        if let Some(t) = self.teams.get(company_id) {
-            self.upsert_teams(company_id, &t).await;
+        // VFS Group and Directory structure
+        let clean_name = name.to_lowercase()
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+            .collect::<String>();
+        let clean_name = if clean_name.is_empty() { "team".to_string() } else { clean_name };
+
+        let _ = self.turso.execute(
+            "INSERT OR IGNORE INTO vfs_groups (company_id, gid, name) VALUES (?, ?, ?)",
+            libsql::params![company_id.to_string(), team_id.clone(), name.to_string()],
+        ).await;
+
+        if let Some(comp) = self.companies.get(company_id) {
+            for m in &comp.members {
+                let _ = self.turso.execute(
+                    "INSERT OR IGNORE INTO vfs_group_members (company_id, gid, uid) VALUES (?, ?, ?)",
+                    libsql::params![company_id.to_string(), team_id.clone(), m.user_id.clone()],
+                ).await;
+            }
         }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let team_proj_ino = format!("dir_proj_{}", team_id);
+        let owner_id = self.companies.get(company_id).map(|c| c.owner_id.clone()).unwrap_or_else(|| "admin".to_string());
+
+        let _ = self.turso.execute(
+            "INSERT OR IGNORE INTO vfs_inodes (company_id, id, parent_id, name, kind, owner, gid, mode, sealed, size, mtime, ctime, blob_ref, meta_json)
+             VALUES (?, ?, 'dir_projects', ?, 'dir', ?, ?, ?, 0, 0, ?, ?, NULL, NULL)",
+            libsql::params![company_id.to_string(), team_proj_ino.clone(), clean_name.clone(), owner_id.clone(), team_id.clone(), 0o775 as i64, now.clone(), now.clone()],
+        ).await;
+
+        for sub in &["docs", "sheets", "boards", "tasks"] {
+            let sub_ino = format!("dir_proj_{}_{}", team_id, sub);
+            let _ = self.turso.execute(
+                "INSERT OR IGNORE INTO vfs_inodes (company_id, id, parent_id, name, kind, owner, gid, mode, sealed, size, mtime, ctime, blob_ref, meta_json)
+                 VALUES (?, ?, ?, ?, 'dir', ?, ?, ?, 0, 0, ?, ?, NULL, NULL)",
+                libsql::params![company_id.to_string(), sub_ino, team_proj_ino.clone(), sub.to_string(), owner_id.clone(), team_id.clone(), 0o775 as i64, now.clone(), now.clone()],
+            ).await;
+        }
+
+        let chan_ino = format!("chat_proj_{}", team_id);
+        let _ = self.turso.execute(
+            "INSERT OR IGNORE INTO vfs_inodes (company_id, id, parent_id, name, kind, owner, gid, mode, sealed, size, mtime, ctime, blob_ref, meta_json)
+             VALUES (?, ?, 'dir_chats_public', ?, 'chat', ?, ?, ?, 0, 0, ?, ?, NULL, NULL)",
+            libsql::params![company_id.to_string(), chan_ino, clean_name.clone(), owner_id.clone(), team_id.clone(), 0o664 as i64, now.clone(), now.clone()],
+        ).await;
+
         Ok(team)
     }
 
@@ -1690,9 +1973,22 @@ impl Database {
         if let Some(mut list) = self.teams.get_mut(company_id) {
             list.retain(|t| t.id != team_id);
         }
-        if let Some(t) = self.teams.get(company_id) {
-            self.upsert_teams(company_id, &t).await;
-        }
+        let _ = self.turso.execute(
+            "DELETE FROM vfs_groups WHERE company_id = ? AND gid = ?",
+            libsql::params![company_id.to_string(), team_id.to_string()],
+        ).await;
+        let _ = self.turso.execute(
+            "DELETE FROM vfs_group_members WHERE company_id = ? AND gid = ?",
+            libsql::params![company_id.to_string(), team_id.to_string()],
+        ).await;
+        let _ = self.turso.execute(
+            "DELETE FROM vfs_inodes WHERE company_id = ? AND id = ?",
+            libsql::params![company_id.to_string(), format!("chat_proj_{}", team_id)],
+        ).await;
+        let _ = self.turso.execute(
+            "DELETE FROM vfs_inodes WHERE company_id = ? AND id = ?",
+            libsql::params![company_id.to_string(), format!("dir_proj_{}", team_id)],
+        ).await;
         Ok(())
     }
 
@@ -1851,7 +2147,6 @@ impl Database {
 
 
     pub async fn save_asset(&self, company_id: &str, asset: WorkspaceAsset) -> Result<WorkspaceAsset> {
-
         let comp_id = company_id.to_string();
         if let Some(mut list) = self.assets.get_mut(&comp_id) {
             if let Some(idx) = list.iter().position(|a| a.id == asset.id) {
@@ -1860,7 +2155,7 @@ impl Database {
                 list.push(asset.clone());
             }
         } else {
-            self.assets.insert(comp_id, vec![asset.clone()]);
+            self.assets.insert(comp_id.clone(), vec![asset.clone()]);
         }
 
         // Index in Tantivy search engine
@@ -1873,22 +2168,162 @@ impl Database {
             let _ = writer.commit();
         }
 
-        if let Some(a) = self.assets.get(company_id) {
-            self.upsert_assets(company_id, &a).await;
-        }
+        // Persist to VFS inodes
+        let (parent_id, kind) = match asset.asset_type.as_str() {
+            "spreadsheet" => {
+                if let Some(ref tid) = asset.team_id {
+                    (format!("dir_proj_{}_sheets", tid), crate::vfs::InodeKind::Sheet)
+                } else {
+                    ("dir_proj_gen_sheets".to_string(), crate::vfs::InodeKind::Sheet)
+                }
+            }
+            "doc" | "document" => {
+                if let Some(ref tid) = asset.team_id {
+                    (format!("dir_proj_{}_docs", tid), crate::vfs::InodeKind::Doc)
+                } else {
+                    ("dir_proj_gen_docs".to_string(), crate::vfs::InodeKind::Doc)
+                }
+            }
+            "whiteboard" => {
+                if let Some(ref tid) = asset.team_id {
+                    (format!("dir_proj_{}_boards", tid), crate::vfs::InodeKind::Board)
+                } else {
+                    ("dir_proj_gen_boards".to_string(), crate::vfs::InodeKind::Board)
+                }
+            }
+            "task" => {
+                if let Some(ref tid) = asset.team_id {
+                    (format!("dir_proj_{}_tasks", tid), crate::vfs::InodeKind::Task)
+                } else {
+                    ("dir_proj_gen_tasks".to_string(), crate::vfs::InodeKind::Task)
+                }
+            }
+            _ => ("dir_shared".to_string(), crate::vfs::InodeKind::File),
+        };
+
+        let enc_content = crate::crypto::encrypt_for_org(company_id, asset.content.as_bytes())
+            .unwrap_or_else(|_| asset.content.clone());
+
+        let clean_name = asset.name.trim().replace('/', "_");
+        let clean_name = if clean_name.is_empty() { "untitled".to_string() } else { clean_name };
+        let ino_id = if asset.id.starts_with("ino_") { asset.id.clone() } else { format!("ino_{}", asset.id) };
+        let now = chrono::Utc::now().to_rfc3339();
+        let owner = if asset.created_by.is_empty() { "admin".to_string() } else { asset.created_by.clone() };
+
+        let _ = self.turso.execute(
+            "INSERT INTO vfs_inodes (company_id, id, parent_id, name, kind, owner, gid, mode, sealed, size, mtime, ctime, blob_ref, meta_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'everyone', 436, 0, ?7, ?8, ?8, NULL, ?9)
+             ON CONFLICT(company_id, id) DO UPDATE SET
+                name = excluded.name,
+                kind = excluded.kind,
+                size = excluded.size,
+                mtime = excluded.mtime,
+                meta_json = excluded.meta_json",
+            libsql::params![
+                comp_id,
+                ino_id,
+                parent_id,
+                clean_name,
+                kind.as_str(),
+                owner,
+                asset.content.len() as i64,
+                now,
+                enc_content
+            ],
+        ).await;
+
         self.touch_company_activity(company_id).await;
         Ok(asset)
     }
 
-    pub async fn save_chat_message(&self, channel_or_company_id: &str, msg: ChatMessage) -> Result<ChatMessage> {
-        let key = channel_or_company_id.to_string();
-        let current_list = {
-            let mut list = self.messages.entry(key.clone()).or_insert_with(Vec::new);
-            if !list.iter().any(|m| m.id == msg.id) {
-                list.push(msg.clone());
+    pub async fn delete_asset(&self, company_id: &str, asset_id: &str) -> Result<()> {
+        let ino_id = if asset_id.starts_with("ino_") { asset_id.to_string() } else { format!("ino_{}", asset_id) };
+
+        if let Ok(mut rows) = self.turso.query(
+            "SELECT blob_ref FROM vfs_inodes WHERE company_id = ? AND (id = ? OR id = ?)",
+            libsql::params![company_id.to_string(), ino_id.clone(), asset_id.to_string()],
+        ).await {
+            while let Ok(Some(row)) = rows.next().await {
+                if let Ok(blob_key) = row.get::<String>(0) {
+                    let file_path = format!("public/uploads/{}", blob_key);
+                    let _ = tokio::fs::remove_file(file_path).await;
+                }
             }
-            list.clone()
+        }
+
+        let _ = self.turso.execute(
+            "DELETE FROM vfs_inodes WHERE company_id = ? AND (id = ? OR id = ?)",
+            libsql::params![company_id.to_string(), ino_id.clone(), asset_id.to_string()],
+        ).await;
+
+        let _ = self.turso.execute(
+            "DELETE FROM vfs_acl WHERE company_id = ? AND (inode_id = ? OR inode_id = ?)",
+            libsql::params![company_id.to_string(), ino_id, asset_id.to_string()],
+        ).await;
+
+        if let Some(mut list) = self.assets.get_mut(company_id) {
+            list.retain(|a| a.id != asset_id && format!("ino_{}", a.id) != asset_id);
+        }
+
+        Ok(())
+    }
+
+    pub async fn save_chat_message(&self, channel_or_company_id: &str, msg: ChatMessage) -> Result<ChatMessage> {
+        let company_id = msg.company_id.clone();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let chat_ino_id = if channel_or_company_id.starts_with("enc:v1:") {
+            let parts: Vec<&str> = channel_or_company_id.split(':').collect();
+            if parts.len() >= 4 {
+                let u1 = parts[2];
+                let u2 = parts[3];
+                let (low, high) = if u1 < u2 { (u1, u2) } else { (u2, u1) };
+                let dm_name = format!("{}_{}", low, high);
+                let dm_gid = format!("dm_{}", dm_name);
+                let dm_ino_id = format!("chat_dm_{}", dm_name);
+
+                let _ = self.turso.execute(
+                    "INSERT OR IGNORE INTO vfs_groups (company_id, gid, name) VALUES (?, ?, ?)",
+                    libsql::params![company_id.clone(), dm_gid.clone(), format!("DM: {}", dm_name)],
+                ).await;
+                let _ = self.turso.execute(
+                    "INSERT OR IGNORE INTO vfs_group_members (company_id, gid, uid) VALUES (?, ?, ?)",
+                    libsql::params![company_id.clone(), dm_gid.clone(), low.to_string()],
+                ).await;
+                let _ = self.turso.execute(
+                    "INSERT OR IGNORE INTO vfs_group_members (company_id, gid, uid) VALUES (?, ?, ?)",
+                    libsql::params![company_id.clone(), dm_gid.clone(), high.to_string()],
+                ).await;
+                let _ = self.turso.execute(
+                    "INSERT OR IGNORE INTO vfs_inodes (company_id, id, parent_id, name, kind, owner, gid, mode, sealed, size, mtime, ctime, blob_ref, meta_json)
+                     VALUES (?, ?, 'dir_chats_dm', ?, 'chat', ?, ?, 432, 1, 0, ?, ?, NULL, NULL)",
+                    libsql::params![company_id.clone(), dm_ino_id.clone(), dm_name, low.to_string(), dm_gid, now.clone(), now.clone()],
+                ).await;
+
+                dm_ino_id
+            } else {
+                "chat_public_general".to_string()
+            }
+        } else if channel_or_company_id.starts_with("team_") && !channel_or_company_id.ends_with("_gen") {
+            format!("chat_proj_{}", channel_or_company_id)
+        } else {
+            "chat_public_general".to_string()
         };
+
+        // Serialize full ChatMessage into JSON and encrypt it
+        let msg_json = serde_json::to_string(&msg)?;
+        let enc_body = crate::crypto::encrypt_for_org(&company_id, msg_json.as_bytes())?;
+
+        let _ = self.turso.execute(
+            "INSERT INTO vfs_messages (company_id, id, chat_inode_id, sender_uid, ts, body_encrypted)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            libsql::params![company_id.clone(), msg.id.clone(), chat_ino_id.clone(), msg.user_id.clone(), msg.timestamp.clone(), enc_body],
+        ).await;
+
+        let _ = self.turso.execute(
+            "UPDATE vfs_inodes SET mtime = ?, size = size + 1 WHERE company_id = ? AND id = ?",
+            libsql::params![now, company_id.clone(), chat_ino_id],
+        ).await;
 
         // Index chat message in Tantivy search
         if let Ok(mut writer) = self.search_index.writer(10_000_000) {
@@ -1900,74 +2335,92 @@ impl Database {
             let _ = writer.commit();
         }
 
-        self.upsert_messages(&key, &current_list).await;
+        let key = channel_or_company_id.to_string();
+        let mut list = self.messages.entry(key).or_insert_with(Vec::new);
+        if !list.iter().any(|m| m.id == msg.id) {
+            list.push(msg.clone());
+        }
+
         self.touch_company_activity(&msg.company_id).await;
         Ok(msg)
     }
 
     pub async fn get_channel_messages(&self, channel_or_company_id: &str) -> Vec<ChatMessage> {
+        let (company_id, chat_ino_id) = if channel_or_company_id.starts_with("enc:v1:") {
+            let parts: Vec<&str> = channel_or_company_id.split(':').collect();
+            let comp = parts.get(1).unwrap_or(&"").to_string();
+            if parts.len() >= 4 {
+                let u1 = parts[2];
+                let u2 = parts[3];
+                let (low, high) = if u1 < u2 { (u1, u2) } else { (u2, u1) };
+                (comp, format!("chat_dm_{}_{}", low, high))
+            } else {
+                (comp, "chat_public_general".to_string())
+            }
+        } else if channel_or_company_id.starts_with("team_") && !channel_or_company_id.ends_with("_gen") {
+            let comp_id = self.teams.iter()
+                .find(|e| e.value().iter().any(|t| t.id == channel_or_company_id))
+                .map(|e| e.key().clone())
+                .unwrap_or_else(|| channel_or_company_id.to_string());
+            (comp_id, format!("chat_proj_{}", channel_or_company_id))
+        } else if channel_or_company_id.starts_with("team_") && channel_or_company_id.ends_with("_gen") {
+            let comp_id = channel_or_company_id
+                .trim_start_matches("team_")
+                .trim_end_matches("_gen")
+                .to_string();
+            (comp_id, "chat_public_general".to_string())
+        } else {
+            (channel_or_company_id.to_string(), "chat_public_general".to_string())
+        };
+
         let mut results = Vec::new();
         let mut seen_ids = std::collections::HashSet::new();
 
-        // 1. Check in-memory DashMap for primary key
-        if let Some(m) = self.messages.get(channel_or_company_id) {
-            for item in m.value().iter() {
-                if seen_ids.insert(item.id.clone()) {
-                    results.push(item.clone());
+        if let Ok(mut rows) = self.turso.query(
+            "SELECT id, company_id, chat_inode_id, sender_uid, ts, body_encrypted
+             FROM vfs_messages
+             WHERE company_id = ? AND chat_inode_id = ?
+             ORDER BY ts ASC",
+            libsql::params![company_id.clone(), chat_ino_id],
+        ).await {
+            while let Ok(Some(row)) = rows.next().await {
+                let id: String = row.get(0).unwrap_or_default();
+                let cid: String = row.get(1).unwrap_or_default();
+                let _chi: String = row.get(2).unwrap_or_default();
+                let sender_uid: String = row.get(3).unwrap_or_default();
+                let ts: String = row.get(4).unwrap_or_default();
+                let enc_body: String = row.get(5).unwrap_or_default();
+
+                if !seen_ids.insert(id.clone()) {
+                    continue;
+                }
+
+                let decrypted_body = match crate::crypto::decrypt_for_org(Some(&cid), &enc_body) {
+                    Ok((_, bytes)) => String::from_utf8_lossy(&bytes).to_string(),
+                    Err(_) => enc_body,
+                };
+
+                if let Ok(deserialized) = serde_json::from_str::<ChatMessage>(&decrypted_body) {
+                    results.push(deserialized);
+                } else {
+                    let username = self.get_user_by_id(&sender_uid)
+                        .map(|u| u.username)
+                        .unwrap_or_else(|| sender_uid.clone());
+                    results.push(ChatMessage {
+                        id,
+                        company_id: cid,
+                        team_id: None,
+                        user_id: sender_uid,
+                        username,
+                        message: decrypted_body,
+                        timestamp: ts,
+                        file_attachment: None,
+                        reactions: None,
+                    });
                 }
             }
         }
 
-        // 2. Check aliased keys for General channel (e.g. "team_<id>_gen" vs "<id>")
-        let mut alias_keys = Vec::new();
-        if channel_or_company_id.starts_with("team_") && channel_or_company_id.ends_with("_gen") {
-            let comp_id = channel_or_company_id
-                .trim_start_matches("team_")
-                .trim_end_matches("_gen");
-            alias_keys.push(comp_id.to_string());
-        } else {
-            alias_keys.push(format!("team_{}_gen", channel_or_company_id));
-        }
-
-        for alias in &alias_keys {
-            if let Some(m) = self.messages.get(alias) {
-                for item in m.value().iter() {
-                    if seen_ids.insert(item.id.clone()) {
-                        results.push(item.clone());
-                    }
-                }
-            }
-        }
-
-        // 3. Fallback: Query database directly from ts_messages if empty
-        if results.is_empty() {
-            let mut keys_to_query = vec![channel_or_company_id.to_string()];
-            keys_to_query.extend(alias_keys.clone());
-
-            for qk in keys_to_query {
-                if let Ok(mut rows) = self.turso.query(
-                    "SELECT data FROM ts_messages WHERE key = ?1",
-                    libsql::params![qk.clone()],
-                ).await {
-                    if let Ok(Some(row)) = rows.next().await {
-                        if let Ok(data_str) = row.get::<String>(0) {
-                            if let Ok(bytes) = crate::crypto::decrypt_payload(None, &data_str) {
-                                if let Ok(loaded) = serde_json::from_slice::<Vec<ChatMessage>>(&bytes) {
-                                    self.messages.insert(qk, loaded.clone());
-                                    for item in loaded {
-                                        if seen_ids.insert(item.id.clone()) {
-                                            results.push(item);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        results.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
         results
     }
 
@@ -2066,7 +2519,78 @@ impl Database {
     }
 
     pub async fn get_assets(&self, company_id: &str) -> Vec<WorkspaceAsset> {
-        self.assets.get(company_id).map(|a| a.value().clone()).unwrap_or_default()
+        let mut results = Vec::new();
+        if let Ok(mut rows) = self.turso.query(
+            "SELECT id, parent_id, name, kind, owner, mtime, meta_json, blob_ref
+             FROM vfs_inodes
+             WHERE company_id = ? AND kind IN ('sheet', 'doc', 'board', 'task', 'file')
+               AND (parent_id IS NULL OR parent_id NOT IN ('dir_etc', 'dir_var_log'))
+               AND id NOT IN ('file_audit_log', 'file_etc_passwd', 'file_etc_group', 'file_etc_org_conf')",
+            libsql::params![company_id.to_string()],
+        ).await {
+            while let Ok(Some(row)) = rows.next().await {
+                let id: String = row.get(0).unwrap_or_default();
+                let parent_id: Option<String> = row.get(1).ok();
+                let name: String = row.get(2).unwrap_or_default();
+                let kind: String = row.get(3).unwrap_or_default();
+                let owner: String = row.get(4).unwrap_or_default();
+                let mtime: String = row.get(5).unwrap_or_default();
+                let meta_json: Option<String> = row.get(6).ok();
+                let blob_ref: Option<String> = row.get(7).ok();
+
+                let asset_type = match kind.as_str() {
+                    "sheet" => "spreadsheet".to_string(),
+                    "doc" => "doc".to_string(),
+                    "board" => "whiteboard".to_string(),
+                    "task" => "task".to_string(),
+                    _ => "file".to_string(),
+                };
+
+                let content = if let Some(meta) = meta_json {
+                    match crate::crypto::decrypt_for_org(Some(company_id), &meta) {
+                        Ok((_, bytes)) => String::from_utf8_lossy(&bytes).to_string(),
+                        Err(_) => meta,
+                    }
+                } else if let Some(blob_key) = blob_ref {
+                    let file_path = format!("public/uploads/{}", blob_key);
+                    match tokio::fs::read(&file_path).await {
+                        Ok(bytes) => match crate::crypto::decrypt_for_org(Some(company_id), &String::from_utf8_lossy(&bytes)) {
+                            Ok((_, b)) => String::from_utf8_lossy(&b).to_string(),
+                            Err(_) => String::from_utf8_lossy(&bytes).to_string(),
+                        },
+                        Err(_) => String::new(),
+                    }
+                } else {
+                    String::new()
+                };
+
+                let clean_id = id.trim_start_matches("ino_").to_string();
+                let team_id = parent_id.and_then(|pid| {
+                    if pid.starts_with("dir_proj_") {
+                        let parts: Vec<&str> = pid.split('_').collect();
+                        if parts.len() >= 3 && parts[2] != "gen" {
+                            Some(format!("{}_{}", parts[1], parts[2]))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                });
+
+                results.push(WorkspaceAsset {
+                    id: clean_id,
+                    company_id: company_id.to_string(),
+                    team_id,
+                    asset_type,
+                    name,
+                    content,
+                    created_by: owner,
+                    updated_at: mtime,
+                });
+            }
+        }
+        results
     }
 
     pub async fn update_user_active_seconds(&self, user_id: &str, total_seconds: u64) -> Result<UserProfile> {

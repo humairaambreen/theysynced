@@ -59,7 +59,7 @@ impl VfsEngine {
         }
     }
 
-    async fn get_inode_by_id(&self, company_id: &str, id: &str) -> Result<VfsInode, VfsError> {
+    pub async fn get_inode_by_id(&self, company_id: &str, id: &str) -> Result<VfsInode, VfsError> {
         let mut rows = self.turso.query(
             "SELECT company_id, id, parent_id, name, kind, owner, gid, mode, sealed, size, mtime, ctime, blob_ref, meta_json
              FROM vfs_inodes WHERE company_id = ? AND id = ?",
@@ -71,6 +71,40 @@ impl VfsEngine {
         } else {
             Err(VfsError::ENOENT)
         }
+    }
+
+    pub async fn unlink_by_id(&self, cred: &Cred, inode_id: &str) -> Result<(), VfsError> {
+        let target = self.get_inode_by_id(&cred.company_id, inode_id).await?;
+        if target.kind == InodeKind::Dir {
+            return Err(VfsError::EISDIR);
+        }
+
+        if let Some(ref pid) = target.parent_id {
+            let parent = self.get_inode_by_id(&cred.company_id, pid).await?;
+            let acl = self.get_acl(&cred.company_id, &parent.id, &cred.uid).await?;
+            if !can_write(cred, &parent, acl.as_ref()) {
+                self.write_audit(&cred.company_id, &cred.uid, "unlink", Some(&target.id), false, Some(inode_id)).await;
+                return Err(VfsError::EACCES);
+            }
+        }
+
+        if let Some(ref blob_key) = target.blob_ref {
+            let file_path = format!("public/uploads/{}", blob_key);
+            let _ = tokio::fs::remove_file(file_path).await;
+        }
+
+        self.turso.execute(
+            "DELETE FROM vfs_inodes WHERE company_id = ? AND id = ?",
+            libsql::params![cred.company_id.clone(), target.id.clone()],
+        ).await.map_err(|e| VfsError::EIO(e.to_string()))?;
+
+        let _ = self.turso.execute(
+            "DELETE FROM vfs_acl WHERE company_id = ? AND inode_id = ?",
+            libsql::params![cred.company_id.clone(), target.id.clone()],
+        ).await;
+
+        self.write_audit(&cred.company_id, &cred.uid, "unlink", Some(&target.id), true, Some(inode_id)).await;
+        Ok(())
     }
 
     async fn get_child_inode(&self, company_id: &str, parent_id: &str, name: &str) -> Result<Option<VfsInode>, VfsError> {
@@ -516,7 +550,13 @@ impl VfsEngine {
             for m in msgs {
                 let sender_display = self.get_user_name(&cred.company_id, &m.sender_uid).await
                     .unwrap_or_else(|| m.sender_uid.clone());
-                formatted.push_str(&format!("[{}] {}: {}\n", m.ts, sender_display, m.body_encrypted));
+                let text = if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&m.body_encrypted) {
+                    parsed.get("message").and_then(|v| v.as_str()).map(|s| s.to_string())
+                        .unwrap_or_else(|| m.body_encrypted.clone())
+                } else {
+                    m.body_encrypted.clone()
+                };
+                formatted.push_str(&format!("[{}] {}: {}\n", m.ts, sender_display, text));
             }
             self.write_audit(&cred.company_id, &cred.uid, "read", Some(&inode.id), true, Some("chat plain-text render")).await;
             return Ok(formatted.into_bytes());

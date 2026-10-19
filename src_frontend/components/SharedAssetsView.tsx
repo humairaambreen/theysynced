@@ -1,16 +1,15 @@
 'use client';
 
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect, useCallback } from 'react';
 import { Company, Team, ChatMessage, UserProfile, WorkspaceAsset, ActiveTab } from '../types';
 import { 
-  Folder, FolderPlus, Upload, Search, Trash2, Edit2, Download, 
-  ExternalLink, Eye, ChevronRight, FileText, Image, Video, Music, 
-  FileCode, File, Globe, Lock, Check, X, ShieldAlert, Sparkles, 
-  ArrowLeft, HardDrive, RefreshCw, MessageSquare, Terminal, Table, 
-  PenTool, Code, CheckCircle, CheckSquare
+  Folder, FolderPlus, Upload, Search, Trash2, Download, 
+  ExternalLink, Eye, ChevronRight, FileText, File, FileCode, Lock, X, 
+  HardDrive, RefreshCw, MessageSquare, Terminal, Table, 
+  PenTool, Code, CheckCircle, CheckSquare, ShieldCheck
 } from 'lucide-react';
 import { ConfirmModal } from './ConfirmModal';
-import { buildCompanyLinuxFilesystem } from '../lib/linuxFilesystem';
+import { VfsClient, VfsInode, formatPosixMode, InodeKind } from '../lib/linuxFilesystem';
 
 interface SharedAssetsViewProps {
   user: UserProfile;
@@ -39,25 +38,27 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
   onNavigateTab,
   token,
 }) => {
-  // Navigation State: Breadcrumb path of folder IDs / virtual path
-  const [currentPath, setCurrentPath] = useState<string[]>(['root']);
+  // Real VFS Navigation State
+  const [currentVfsPath, setCurrentVfsPath] = useState<string>('/');
+  const [vfsEntries, setVfsEntries] = useState<VfsInode[]>([]);
+  const [vfsLoading, setVfsLoading] = useState<boolean>(false);
+  const [vfsError, setVfsError] = useState<string | null>(null);
+
   const [searchQuery, setSearchQuery] = useState('');
   const [activeFilter, setActiveFilter] = useState<FilterType>('all');
   
   // Modals & Actions State
   const [showNewFolderModal, setShowNewFolderModal] = useState(false);
   const [newFolderName, setNewFolderName] = useState('');
-  const [newFolderScope, setNewFolderScope] = useState<'shared' | 'private'>('shared');
 
   const [showNewFileModal, setShowNewFileModal] = useState(false);
   const [newFileName, setNewFileName] = useState('');
   const [newFileContent, setNewFileContent] = useState('');
   
-  const [renameTarget, setRenameTarget] = useState<WorkspaceAsset | null>(null);
+  const [renameTarget, setRenameTarget] = useState<VfsInode | null>(null);
   const [renameValue, setRenameValue] = useState('');
   
-  const [previewFile, setPreviewFile] = useState<WorkspaceAsset | null>(null);
-  const [copiedLink, setCopiedLink] = useState<string | null>(null);
+  const [previewContent, setPreviewContent] = useState<{ name: string; content: string; inode?: VfsInode } | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [exportNotice, setExportNotice] = useState<string | null>(null);
@@ -85,270 +86,54 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
     );
   }, [company, user.id]);
 
-  // Unified Company Linux Filesystem & Virtual Assets
-  const { entries: linuxEntries, virtualAssets: linuxVirtualAssets } = useMemo(() => {
-    return buildCompanyLinuxFilesystem(company, teams, chatMessages, assets, user);
-  }, [company, teams, chatMessages, assets, user]);
+  const effectiveToken = useMemo(() => {
+    return token || (typeof window !== 'undefined' ? localStorage.getItem('theysynced_token') || '' : '');
+  }, [token]);
 
-  // Merged Assets: Real D1 assets + Linux generated system assets
-  const mergedAssets = useMemo(() => {
-    const list = [...assets];
-    linuxVirtualAssets.forEach((va) => {
-      if (!list.some((a) => a.name === va.name && a.folder_path === va.folder_path)) {
-        list.push(va);
-      }
+  const vfsClient = useMemo(() => {
+    return new VfsClient(effectiveToken, company.id);
+  }, [effectiveToken, company.id]);
+
+  // Load Real VFS Directory
+  const loadVfsDirectory = useCallback(async (path: string) => {
+    try {
+      setVfsLoading(true);
+      setVfsError(null);
+      const entries = await vfsClient.readdir(path);
+      setVfsEntries(entries);
+      setCurrentVfsPath(path);
+    } catch (err: any) {
+      setVfsError(err.message || 'Failed to list VFS directory');
+    } finally {
+      setVfsLoading(false);
+    }
+  }, [vfsClient]);
+
+  // Initial directory load
+  useEffect(() => {
+    loadVfsDirectory(currentVfsPath);
+  }, [loadVfsDirectory, currentVfsPath]);
+
+  // Subscribe to /ws/vfs live events
+  useEffect(() => {
+    const unsub = vfsClient.connectWs((_event) => {
+      loadVfsDirectory(currentVfsPath);
     });
-    return list;
-  }, [assets, linuxVirtualAssets]);
+    return () => unsub();
+  }, [vfsClient, currentVfsPath, loadVfsDirectory]);
 
-  // Filter accessible assets based on permission rules
-  const accessibleAssets = useMemo(() => {
-    return mergedAssets.filter((asset) => {
-      if (asset.scope === 'dm' || asset.folder_path?.includes('/Direct Messages/')) {
-        if (isAdmin) return true;
-        if (asset.allowed_users && asset.allowed_users.length > 0) {
-          return asset.allowed_users.some(
-            (u) => u.toLowerCase() === user.username.toLowerCase()
-          );
-        }
-        const dmMatch = asset.folder_path?.match(/@([a-zA-Z0-9_.-]+)\s*&\s*@([a-zA-Z0-9_.-]+)/);
-        if (dmMatch) {
-          const u1 = dmMatch[1].toLowerCase();
-          const u2 = dmMatch[2].toLowerCase();
-          const current = user.username.toLowerCase();
-          return current === u1 || current === u2;
-        }
-        return false;
+  // Filter items by search and category
+  const filteredEntries = useMemo(() => {
+    return vfsEntries.filter((item) => {
+      if (searchQuery.trim()) {
+        const q = searchQuery.toLowerCase();
+        const matchesName = item.name.toLowerCase().includes(q);
+        const matchesOwner = item.owner.toLowerCase().includes(q);
+        const matchesKind = item.kind.toLowerCase().includes(q);
+        if (!matchesName && !matchesOwner && !matchesKind) return false;
       }
 
-      if (asset.scope === 'private') {
-        if (isAdmin) return true;
-        return asset.created_by.toLowerCase() === user.username.toLowerCase();
-      }
-
-      return true;
-    });
-  }, [mergedAssets, isAdmin, user.username]);
-
-  const currentFolderId = currentPath[currentPath.length - 1];
-
-  // Derive Current Linux Path for Terminal cd
-  const currentLinuxPath = useMemo(() => {
-    if (currentFolderId === 'root') return '/workspace';
-    if (currentFolderId === 'v_linux_chats') return '/workspace/chats';
-    if (currentFolderId === 'v_linux_sheets') return '/workspace/spreadsheets';
-    if (currentFolderId === 'v_linux_drawings') return '/workspace/drawings';
-    if (currentFolderId === 'v_linux_docs') return '/workspace/docs';
-    if (currentFolderId === 'v_linux_files') return '/workspace/files';
-    if (currentFolderId === 'v_linux_tasks') return '/workspace/tasks';
-    if (currentFolderId === 'v_linux_export') return '/workspace/export';
-    const f = accessibleAssets.find((a) => a.id === currentFolderId);
-    return f ? `/workspace/${f.name}` : '/workspace';
-  }, [currentFolderId, accessibleAssets]);
-
-  // Items in Current Folder
-  const currentItems = useMemo<WorkspaceAsset[]>(() => {
-    if (searchQuery.trim()) {
-      const q = searchQuery.toLowerCase();
-      return accessibleAssets.filter((a) => {
-        if (a.asset_type === 'folder') return false;
-        const matchesName = a.name.toLowerCase().includes(q);
-        const matchesUploader = a.created_by.toLowerCase().includes(q);
-        const matchesType = a.file_type?.toLowerCase().includes(q);
-        return matchesName || matchesUploader || matchesType;
-      });
-    }
-
-    if (currentFolderId === 'root') {
-      const customRootFolders = accessibleAssets.filter(
-        (a) => a.asset_type === 'folder' && (!a.parent_id || a.parent_id === 'root') && !a.folder_path?.startsWith('/Chat Attachments')
-      );
-
-      const linuxSystemFolders: WorkspaceAsset[] = [
-        {
-          id: 'v_linux_chats',
-          company_id: company.id,
-          asset_type: 'folder',
-          name: 'chats',
-          created_by: 'Linux Kernel',
-          updated_at: new Date().toISOString(),
-          folder_path: '/workspace/chats',
-          scope: 'shared',
-        },
-        {
-          id: 'v_linux_sheets',
-          company_id: company.id,
-          asset_type: 'folder',
-          name: 'spreadsheets',
-          created_by: 'Linux Kernel',
-          updated_at: new Date().toISOString(),
-          folder_path: '/workspace/spreadsheets',
-          scope: 'shared',
-        },
-        {
-          id: 'v_linux_drawings',
-          company_id: company.id,
-          asset_type: 'folder',
-          name: 'drawings',
-          created_by: 'Linux Kernel',
-          updated_at: new Date().toISOString(),
-          folder_path: '/workspace/drawings',
-          scope: 'shared',
-        },
-        {
-          id: 'v_linux_docs',
-          company_id: company.id,
-          asset_type: 'folder',
-          name: 'docs',
-          created_by: 'Linux Kernel',
-          updated_at: new Date().toISOString(),
-          folder_path: '/workspace/docs',
-          scope: 'shared',
-        },
-        {
-          id: 'v_linux_files',
-          company_id: company.id,
-          asset_type: 'folder',
-          name: 'files',
-          created_by: 'Linux Kernel',
-          updated_at: new Date().toISOString(),
-          folder_path: '/workspace/files',
-          scope: 'shared',
-        },
-        {
-          id: 'v_linux_tasks',
-          company_id: company.id,
-          asset_type: 'folder',
-          name: 'tasks',
-          created_by: 'Linux Kernel',
-          updated_at: new Date().toISOString(),
-          folder_path: '/workspace/tasks',
-          scope: 'shared',
-        },
-        {
-          id: 'v_linux_export',
-          company_id: company.id,
-          asset_type: 'folder',
-          name: 'export',
-          created_by: 'Linux Kernel',
-          updated_at: new Date().toISOString(),
-          folder_path: '/workspace/export',
-          scope: 'shared',
-        },
-      ];
-
-      return [...linuxSystemFolders, ...customRootFolders];
-    }
-
-    // Inside /workspace/chats
-    if (currentFolderId === 'v_linux_chats') {
-      return linuxEntries
-        .filter((e) => e.folder === '/workspace/chats')
-        .map((e): WorkspaceAsset => ({
-          id: `chat_file_${e.name}`,
-          company_id: company.id,
-          asset_type: 'file',
-          name: e.name,
-          folder_path: '/workspace/chats',
-          content: e.content,
-          size: e.size,
-          created_by: e.created_by,
-          updated_at: e.updated_at,
-          scope: 'shared',
-        }));
-    }
-
-    // Inside /workspace/spreadsheets
-    if (currentFolderId === 'v_linux_sheets') {
-      return linuxEntries
-        .filter((e) => e.folder === '/workspace/spreadsheets')
-        .map((e): WorkspaceAsset => ({
-          id: e.asset_id || `sheet_${e.name}`,
-          company_id: company.id,
-          asset_type: 'spreadsheet',
-          name: e.name,
-          folder_path: '/workspace/spreadsheets',
-          content: e.content,
-          size: e.size,
-          created_by: e.created_by,
-          updated_at: e.updated_at,
-          scope: 'shared',
-        }));
-    }
-
-    // Inside /workspace/drawings
-    if (currentFolderId === 'v_linux_drawings') {
-      return linuxEntries
-        .filter((e) => e.folder === '/workspace/drawings')
-        .map((e): WorkspaceAsset => ({
-          id: e.asset_id || `drawing_${e.name}`,
-          company_id: company.id,
-          asset_type: 'whiteboard',
-          name: e.name,
-          folder_path: '/workspace/drawings',
-          content: e.content,
-          size: e.size,
-          created_by: e.created_by,
-          updated_at: e.updated_at,
-          scope: 'shared',
-        }));
-    }
-
-    // Inside /workspace/docs
-    if (currentFolderId === 'v_linux_docs') {
-      return linuxEntries
-        .filter((e) => e.folder === '/workspace/docs')
-        .map((e): WorkspaceAsset => ({
-          id: e.asset_id || `doc_${e.name}`,
-          company_id: company.id,
-          asset_type: 'doc',
-          name: e.name,
-          folder_path: '/workspace/docs',
-          content: e.content,
-          size: e.size,
-          created_by: e.created_by,
-          updated_at: e.updated_at,
-          scope: 'shared',
-        }));
-    }
-
-    // Inside /workspace/tasks
-    if (currentFolderId === 'v_linux_tasks') {
-      return linuxEntries
-        .filter((e) => e.folder === '/workspace/tasks')
-        .map((e): WorkspaceAsset => ({
-          id: `tasks_file_${e.name}`,
-          company_id: company.id,
-          asset_type: 'file',
-          name: e.name,
-          folder_path: '/workspace/tasks',
-          content: e.content,
-          size: e.size,
-          created_by: e.created_by,
-          updated_at: e.updated_at,
-          scope: 'shared',
-        }));
-    }
-
-    // Inside /workspace/export
-    if (currentFolderId === 'v_linux_export') {
-      return accessibleAssets.filter((a) => a.folder_path === '/workspace/export' || a.name.includes('backup'));
-    }
-
-    // Inside /workspace/files or custom folder
-    return accessibleAssets.filter((a) => {
-      if (a.parent_id === currentFolderId) return true;
-      if (currentFolderId === 'v_linux_files') {
-        return a.asset_type === 'file' && (!a.folder_path || a.folder_path === '/workspace/files');
-      }
-      return false;
-    });
-  }, [accessibleAssets, currentFolderId, searchQuery, company.id, user.username, linuxEntries]);
-
-  // Filter items by type
-  const filteredItems = useMemo(() => {
-    return currentItems.filter((item) => {
-      if (item.asset_type === 'folder') return true;
+      if (item.kind === 'dir') return true;
       if (activeFilter === 'all') return true;
       const ext = item.name.split('.').pop()?.toLowerCase() || '';
 
@@ -362,69 +147,90 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
         return ['mp3', 'wav', 'ogg', 'm4a', 'flac'].includes(ext);
       }
       if (activeFilter === 'spreadsheets') {
-        return ext === 'csv' || item.name.endsWith('.sheet.json') || item.asset_type === 'spreadsheet';
+        return ext === 'csv' || ext === 'sheet' || item.name.endsWith('.sheet.json') || item.kind === 'sheet';
       }
       if (activeFilter === 'drawings') {
-        return item.name.endsWith('.excalidraw.json') || item.asset_type === 'whiteboard';
+        return ext === 'board' || item.name.endsWith('.excalidraw.json') || item.kind === 'board';
       }
       if (activeFilter === 'documents') {
-        return ext === 'md' || item.name.endsWith('.doc.json') || ext === 'pdf' || ext === 'txt' || item.asset_type === 'doc';
+        return ext === 'md' || ext === 'doc' || item.name.endsWith('.doc.json') || ext === 'pdf' || ext === 'txt' || item.kind === 'doc';
       }
       if (activeFilter === 'chat') {
-        return item.folder_path?.includes('chats') || ext === 'log' || item.name.endsWith('.chat.json');
+        return item.kind === 'chat' || ext === 'log' || item.name.endsWith('.chat.json');
       }
       return true;
     });
-  }, [currentItems, activeFilter]);
+  }, [vfsEntries, searchQuery, activeFilter]);
 
   // Breadcrumbs Navigation
+  const breadcrumbSegments = useMemo(() => {
+    if (currentVfsPath === '/' || !currentVfsPath) return ['/'];
+    const parts = currentVfsPath.split('/').filter(Boolean);
+    return ['/', ...parts];
+  }, [currentVfsPath]);
+
   const navigateToBreadcrumb = (index: number) => {
-    setCurrentPath((prev) => prev.slice(0, index + 1));
+    if (index === 0) {
+      loadVfsDirectory('/');
+    } else {
+      const parts = breadcrumbSegments.slice(1, index + 1);
+      const targetPath = '/' + parts.join('/');
+      loadVfsDirectory(targetPath);
+    }
     setSearchQuery('');
   };
 
-  const handleOpenFolder = (folderId: string) => {
-    setCurrentPath((prev) => [...prev, folderId]);
+  const handleOpenFolder = (folderName: string) => {
+    const nextPath = currentVfsPath === '/' ? `/${folderName}` : `${currentVfsPath}/${folderName}`;
+    loadVfsDirectory(nextPath);
     setSearchQuery('');
   };
 
   // Open File in Visualizer Tab
-  const handleOpenInVisualizer = (item: WorkspaceAsset) => {
+  const handleOpenInVisualizer = async (inode: VfsInode) => {
     if (!onNavigateTab) return;
-    const name = item.name.toLowerCase();
+    const name = inode.name.toLowerCase();
+    const cleanId = inode.id.replace(/^ino_/, '');
 
-    if (name.endsWith('.sheet.json') || name.endsWith('.csv') || item.asset_type === 'spreadsheet') {
-      onNavigateTab('spreadsheet', item.id);
-    } else if (name.endsWith('.excalidraw.json') || item.asset_type === 'whiteboard') {
-      onNavigateTab('whiteboard', item.id);
-    } else if (name.endsWith('.doc.json') || name.endsWith('.md') || item.asset_type === 'doc') {
-      onNavigateTab('docs', item.id);
-    } else if (name.includes('task') || name.includes('kanban') || item.folder_path?.includes('tasks')) {
-      onNavigateTab('tasks', item.id);
-    } else if (name.endsWith('.chat.json') || name.endsWith('.log') || item.folder_path?.includes('chats')) {
-      // Find channel id
-      const chan = teams.find((t) => t.name.toLowerCase() === name.replace(/\.(log|chat\.json)$/, '').replace(/^dm-/, 'dm:'));
-      onNavigateTab('teams', chan ? chan.id : undefined);
+    if (inode.kind === 'sheet' || name.endsWith('.sheet') || name.endsWith('.sheet.json') || name.endsWith('.csv')) {
+      onNavigateTab('spreadsheet', cleanId);
+    } else if (inode.kind === 'board' || name.endsWith('.board') || name.endsWith('.excalidraw.json')) {
+      onNavigateTab('whiteboard', cleanId);
+    } else if (inode.kind === 'doc' || name.endsWith('.doc') || name.endsWith('.doc.json') || name.endsWith('.md')) {
+      onNavigateTab('docs', cleanId);
+    } else if (inode.kind === 'task' || name.endsWith('.task') || name.includes('task')) {
+      onNavigateTab('tasks', cleanId);
+    } else if (inode.kind === 'chat' || name.endsWith('.chat') || name.endsWith('.log')) {
+      const teamMatch = teams.find((t) => t.name.toLowerCase() === name || t.id === cleanId);
+      onNavigateTab('teams', teamMatch ? teamMatch.id : undefined);
     } else {
-      setPreviewFile(item);
+      // Preview plaintext file
+      await handlePreview(inode);
+    }
+  };
+
+  const handlePreview = async (inode: VfsInode) => {
+    try {
+      const fullPath = currentVfsPath === '/' ? `/${inode.name}` : `${currentVfsPath}/${inode.name}`;
+      const content = await vfsClient.read(fullPath);
+      setPreviewContent({ name: inode.name, content, inode });
+    } catch (err: any) {
+      setPreviewContent({ name: inode.name, content: `Error reading file: ${err.message}`, inode });
     }
   };
 
   // Trigger Organization Full Backup
   const handleExportOrgBackup = () => {
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
-    const backupName = `${companySlug}_backup_${timestamp}.json`;
+    const backupName = `${companySlug}_vfs_backup_${timestamp}.json`;
     
-    // Create complete data bundle
     const exportBundle = {
       organization: company,
       exported_at: new Date().toISOString(),
       channels: teams,
       chat_messages: chatMessages,
-      spreadsheets: linuxEntries.filter((e) => e.category === 'spreadsheet'),
-      drawings: linuxEntries.filter((e) => e.category === 'drawing'),
-      docs: linuxEntries.filter((e) => e.category === 'doc'),
-      files: assets.map((a) => ({ name: a.name, type: a.asset_type, url: a.url, size: a.size })),
+      vfs_entries: vfsEntries,
+      assets,
     };
 
     const blob = new Blob([JSON.stringify(exportBundle, null, 2)], { type: 'application/json' });
@@ -445,50 +251,45 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
     e.preventDefault();
     if (!newFolderName.trim()) return;
 
-    const parentId = currentFolderId === 'root' ? 'root' : currentFolderId;
-    const folderId = `folder_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    
-    await onSaveAsset({
-      id: folderId,
-      company_id: company.id,
-      asset_type: 'folder',
-      name: newFolderName.trim(),
-      parent_id: parentId,
-      folder_path: currentLinuxPath,
-      created_by: user.username,
-      updated_at: new Date().toISOString(),
-      scope: newFolderScope,
-    });
-
-    setNewFolderName('');
-    setShowNewFolderModal(false);
+    try {
+      const folderPath = currentVfsPath === '/' ? `/${newFolderName.trim()}` : `${currentVfsPath}/${newFolderName.trim()}`;
+      await vfsClient.mkdir(folderPath, 0o755);
+      setNewFolderName('');
+      setShowNewFolderModal(false);
+      await loadVfsDirectory(currentVfsPath);
+    } catch (err: any) {
+      setUploadError(err.message || 'Failed to create folder');
+    }
   };
 
-  // Create New Code / Script File
+  // Create New File
   const handleCreateFile = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newFileName.trim()) return;
 
-    const fileId = `file_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    await onSaveAsset({
-      id: fileId,
-      company_id: company.id,
-      asset_type: newFileName.endsWith('.sheet.json') ? 'spreadsheet' : newFileName.endsWith('.excalidraw.json') ? 'whiteboard' : newFileName.endsWith('.doc.json') || newFileName.endsWith('.md') ? 'doc' : 'file',
-      name: newFileName.trim(),
-      content: newFileContent,
-      size: newFileContent.length,
-      folder_path: currentLinuxPath,
-      created_by: user.username,
-      updated_at: new Date().toISOString(),
-      scope: 'shared',
-    });
+    try {
+      const filePath = currentVfsPath === '/' ? `/${newFileName.trim()}` : `${currentVfsPath}/${newFileName.trim()}`;
+      const kind: InodeKind = newFileName.endsWith('.sheet') ? 'sheet'
+        : newFileName.endsWith('.doc') ? 'doc'
+        : newFileName.endsWith('.board') ? 'board'
+        : newFileName.endsWith('.task') ? 'task'
+        : 'file';
 
-    setNewFileName('');
-    setNewFileContent('');
-    setShowNewFileModal(false);
+      await vfsClient.create(filePath, kind, 0o644);
+      if (newFileContent) {
+        await vfsClient.write(filePath, newFileContent);
+      }
+
+      setNewFileName('');
+      setNewFileContent('');
+      setShowNewFileModal(false);
+      await loadVfsDirectory(currentVfsPath);
+    } catch (err: any) {
+      setUploadError(err.message || 'Failed to create file');
+    }
   };
 
-  // Upload Files into current folder
+  // Upload Files into current VFS folder
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
@@ -499,49 +300,13 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
     try {
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
-        const base64Data = await new Promise<string>((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => resolve(reader.result as string);
-          reader.onerror = reject;
-          reader.readAsDataURL(file);
-        });
+        const content = await file.text();
+        const targetPath = currentVfsPath === '/' ? `/${file.name}` : `${currentVfsPath}/${file.name}`;
 
-        const effectiveToken = token || (typeof window !== 'undefined' ? localStorage.getItem('theysynced_token') : null);
-        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-        if (effectiveToken) {
-          headers['Authorization'] = `Bearer ${effectiveToken}`;
-        }
-        const uploadRes = await fetch('/api/storage/upload', {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({
-            token: effectiveToken,
-            company_id: company.id,
-            name: file.name,
-            file_type: file.type || 'application/octet-stream',
-            data_base64: base64Data,
-          }),
-        });
-
-        const uploadData = await uploadRes.json();
-        const fileUrl = uploadData.success && uploadData.url ? uploadData.url : base64Data;
-
-        const fileId = `file_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-        await onSaveAsset({
-          id: fileId,
-          company_id: company.id,
-          asset_type: file.type?.includes('pdf') ? 'pdf' : 'file',
-          name: file.name,
-          url: fileUrl,
-          file_type: file.type || 'application/octet-stream',
-          size: file.size,
-          parent_id: currentFolderId === 'root' ? 'root' : currentFolderId,
-          folder_path: currentLinuxPath,
-          created_by: user.username,
-          updated_at: new Date().toISOString(),
-          scope: 'shared',
-        });
+        await vfsClient.create(targetPath, 'file', 0o644);
+        await vfsClient.write(targetPath, content);
       }
+      await loadVfsDirectory(currentVfsPath);
     } catch (err: any) {
       setUploadError(err.message || 'File upload failed');
     } finally {
@@ -550,56 +315,47 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
     }
   };
 
-  // Rename File
-  const handleRename = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!renameTarget || !renameValue.trim()) return;
-
-    await onSaveAsset({
-      id: renameTarget.id,
-      name: renameValue.trim(),
-      updated_at: new Date().toISOString(),
-    });
-
-    setRenameTarget(null);
-    setRenameValue('');
-  };
-
   // Delete Item
-  const handleDelete = (item: WorkspaceAsset) => {
+  const handleDelete = (item: VfsInode) => {
     setConfirmConfig({
       isOpen: true,
-      title: `Delete ${item.asset_type === 'folder' ? 'Folder' : 'File'}`,
-      message: `Are you sure you want to permanently delete "${item.name}" from company storage and Linux filesystem?`,
+      title: `Delete ${item.kind === 'dir' ? 'Folder' : 'File'}`,
+      message: `Are you sure you want to delete "${item.name}" from VFS?`,
       onConfirm: async () => {
-        await onDeleteAsset(item.id);
+        try {
+          const targetPath = currentVfsPath === '/' ? `/${item.name}` : `${currentVfsPath}/${item.name}`;
+          await vfsClient.unlink(targetPath);
+          await loadVfsDirectory(currentVfsPath);
+        } catch (err: any) {
+          setUploadError(err.message || 'Failed to delete file');
+        }
         setConfirmConfig(null);
       },
     });
   };
 
   // Helper to choose item icon
-  const getItemIcon = (item: WorkspaceAsset) => {
-    if (item.asset_type === 'folder') {
+  const getItemIcon = (item: VfsInode) => {
+    if (item.kind === 'dir') {
       return <Folder className="w-5 h-5 text-indigo-500 shrink-0 fill-indigo-50" />;
     }
     const name = item.name.toLowerCase();
-    if (name.endsWith('.sheet.json') || name.endsWith('.csv') || item.asset_type === 'spreadsheet') {
+    if (item.kind === 'sheet' || name.endsWith('.sheet') || name.endsWith('.sheet.json') || name.endsWith('.csv')) {
       return <Table className="w-5 h-5 text-emerald-600 shrink-0" />;
     }
-    if (name.endsWith('.excalidraw.json') || item.asset_type === 'whiteboard') {
+    if (item.kind === 'board' || name.endsWith('.board') || name.endsWith('.excalidraw.json')) {
       return <PenTool className="w-5 h-5 text-purple-600 shrink-0" />;
     }
-    if (name.endsWith('.doc.json') || name.endsWith('.md') || item.asset_type === 'doc') {
+    if (item.kind === 'doc' || name.endsWith('.doc') || name.endsWith('.doc.json') || name.endsWith('.md')) {
       return <FileText className="w-5 h-5 text-blue-600 shrink-0" />;
     }
-    if (name.includes('task') || name.includes('kanban') || item.folder_path?.includes('tasks')) {
+    if (item.kind === 'task' || name.endsWith('.task') || name.includes('task')) {
       return <CheckSquare className="w-5 h-5 text-emerald-600 shrink-0" />;
     }
-    if (name.endsWith('.chat.json') || name.endsWith('.log') || item.folder_path?.includes('chats')) {
+    if (item.kind === 'chat' || name.endsWith('.chat') || name.endsWith('.log')) {
       return <MessageSquare className="w-5 h-5 text-cyan-600 shrink-0" />;
     }
-    if (['py', 'sh', 'js', 'json', 'ts'].includes(name.split('.').pop() || '')) {
+    if (['py', 'sh', 'js', 'json', 'ts', 'rs', 'toml'].includes(name.split('.').pop() || '')) {
       return <Code className="w-5 h-5 text-amber-500 shrink-0" />;
     }
     return <File className="w-5 h-5 text-slate-400 shrink-0" />;
@@ -616,14 +372,14 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
           </div>
           <div>
             <div className="flex items-center space-x-2">
-              <h1 className="text-base font-black text-slate-900 tracking-tight">Linux File System (GUI)</h1>
+              <h1 className="text-base font-black text-slate-900 tracking-tight">Virtual Filesystem (VFS)</h1>
               <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200 flex items-center">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 mr-1.5 animate-pulse" />
                 theysynced-{companySlug}
               </span>
             </div>
             <p className="text-xs text-slate-500">
-              Unified graphical frontend for company Linux filesystem &bull; Direct visualizer interoperability
+              POSIX virtual filesystem backed by libSQL &bull; AES-256-GCM encryption &bull; Single permission authority
             </p>
           </div>
         </div>
@@ -633,7 +389,7 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
           {/* Open in Linux Terminal */}
           {onNavigateTab && (
             <button
-              onClick={() => onNavigateTab('terminal', currentLinuxPath)}
+              onClick={() => onNavigateTab('terminal', currentVfsPath)}
               className="flex items-center space-x-1.5 px-3 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-bold shadow-sm transition-all active:scale-95"
               title="Open Shell in Linux Terminal"
             >
@@ -646,20 +402,26 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
           <button
             onClick={handleExportOrgBackup}
             className="flex items-center space-x-1.5 px-3 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-bold shadow-sm transition-all active:scale-95"
-            title="Export Full Organization Archive (Chats, Sheets, Drawings, Docs, Files)"
+            title="Export Full Organization Archive"
           >
             <Download className="w-3.5 h-3.5" />
-            <span>Export Org Backup</span>
+            <span>Export Archive</span>
           </button>
 
-          {/* Upload Files */}
-          <label className="flex items-center space-x-1.5 px-3 py-2 bg-white border border-slate-200 text-slate-700 hover:bg-slate-50 rounded-xl text-xs font-bold cursor-pointer shadow-sm transition-all active:scale-95">
-            <Upload className="w-3.5 h-3.5 text-indigo-600" />
-            <span>Upload</span>
-            <input type="file" multiple onChange={handleFileUpload} className="hidden" disabled={isUploading} />
+          {/* Upload File */}
+          <label className="flex items-center space-x-1.5 px-3 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold shadow-sm cursor-pointer transition-all active:scale-95">
+            <Upload className="w-3.5 h-3.5" />
+            <span>{isUploading ? 'Uploading...' : 'Upload'}</span>
+            <input
+              type="file"
+              multiple
+              onChange={handleFileUpload}
+              disabled={isUploading}
+              className="hidden"
+            />
           </label>
 
-          {/* New Script / Code File */}
+          {/* New Code / Script File */}
           <button
             onClick={() => setShowNewFileModal(true)}
             className="flex items-center space-x-1.5 px-3 py-2 bg-white border border-slate-200 text-slate-700 hover:bg-slate-50 rounded-xl text-xs font-bold shadow-sm transition-all active:scale-95"
@@ -677,15 +439,13 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
             <span>New Folder</span>
           </button>
 
-          {onRefreshAssets && (
-            <button
-              onClick={onRefreshAssets}
-              className="p-2 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-xl transition-all"
-              title="Refresh Storage"
-            >
-              <RefreshCw className="w-4 h-4" />
-            </button>
-          )}
+          <button
+            onClick={() => loadVfsDirectory(currentVfsPath)}
+            className="p-2 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-xl transition-all"
+            title="Refresh Directory"
+          >
+            <RefreshCw className={`w-4 h-4 ${vfsLoading ? 'animate-spin' : ''}`} />
+          </button>
         </div>
       </header>
 
@@ -702,30 +462,32 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
         </div>
       )}
 
+      {/* Error Banner */}
+      {(vfsError || uploadError) && (
+        <div className="bg-rose-50 border-b border-rose-200 px-6 py-2 flex items-center justify-between text-xs text-rose-800 font-semibold">
+          <span>{vfsError || uploadError}</span>
+          <button onClick={() => { setVfsError(null); setUploadError(null); }} className="text-rose-600 hover:text-rose-900">
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+
       {/* Breadcrumb Path & Filters */}
       <div className="px-6 py-3 bg-white/60 backdrop-blur-sm border-b border-black/[0.03] flex flex-col md:flex-row items-center justify-between gap-3 shrink-0">
         {/* Linux Path Breadcrumbs */}
         <div className="flex items-center space-x-1.5 text-xs text-slate-600 overflow-x-auto w-full md:w-auto py-1 font-mono">
-          <button 
-            onClick={() => navigateToBreadcrumb(0)}
-            className="font-bold text-slate-800 hover:text-indigo-600 flex items-center space-x-1 shrink-0 px-2 py-1 rounded-lg hover:bg-slate-100"
-          >
-            <span>/workspace</span>
-          </button>
-
-          {currentPath.slice(1).map((segment, idx) => {
-            const folderObj = accessibleAssets.find((a) => a.id === segment);
-            const label = segment.replace(/^v_linux_/, '');
+          {breadcrumbSegments.map((segment, idx) => {
+            const isLast = idx === breadcrumbSegments.length - 1;
             return (
-              <React.Fragment key={segment}>
-                <ChevronRight className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+              <React.Fragment key={idx}>
+                {idx > 0 && <ChevronRight className="w-3.5 h-3.5 text-slate-400 shrink-0" />}
                 <button
-                  onClick={() => navigateToBreadcrumb(idx + 1)}
+                  onClick={() => navigateToBreadcrumb(idx)}
                   className={`font-semibold hover:text-indigo-600 truncate max-w-[160px] px-2 py-1 rounded-lg hover:bg-slate-100 ${
-                    idx === currentPath.length - 2 ? 'text-indigo-600 font-bold bg-indigo-50/70' : ''
+                    isLast ? 'text-indigo-600 font-bold bg-indigo-50/70' : 'text-slate-800'
                   }`}
                 >
-                  {folderObj?.name || label}
+                  {segment === '/' ? '/' : segment}
                 </button>
               </React.Fragment>
             );
@@ -738,7 +500,7 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
             <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
             <input
               type="text"
-              placeholder="Search files, logs..."
+              placeholder="Search files..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               className="w-full pl-9 pr-3 py-1.5 bg-slate-100 border border-slate-200 rounded-xl text-xs focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
@@ -750,11 +512,11 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
             onChange={(e) => setActiveFilter(e.target.value as FilterType)}
             className="px-2.5 py-1.5 bg-white border border-slate-200 rounded-xl text-xs font-semibold text-slate-700 focus:outline-none"
           >
-            <option value="all">All Files</option>
+            <option value="all">All Types</option>
             <option value="spreadsheets">Spreadsheets</option>
-            <option value="drawings">Drawings</option>
+            <option value="drawings">Boards & Drawings</option>
             <option value="documents">Docs & MD</option>
-            <option value="chat">Chat Logs</option>
+            <option value="chat">Chat Channels</option>
             <option value="images">Images</option>
             <option value="videos">Videos</option>
           </select>
@@ -763,22 +525,23 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
 
       {/* Main Filesystem View */}
       <div className="flex-1 p-6 overflow-y-auto">
-        {filteredItems.length === 0 ? (
+        {filteredEntries.length === 0 ? (
           <div className="h-64 flex flex-col items-center justify-center text-center p-8 bg-white rounded-3xl border border-dashed border-slate-200">
             <Folder className="w-10 h-10 text-slate-300 mb-2" />
             <h3 className="text-sm font-bold text-slate-700">Directory is Empty</h3>
             <p className="text-xs text-slate-400 mt-1 max-w-sm">
-              Use &quot;Upload&quot;, &quot;New File&quot;, or the Linux Terminal to create files and scripts in this directory.
+              Use &quot;Upload&quot;, &quot;New File&quot;, or the Linux Terminal to create files in this VFS directory.
             </p>
           </div>
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
-            {filteredItems.map((item) => {
-              const isFolder = item.asset_type === 'folder';
+            {filteredEntries.map((item) => {
+              const isFolder = item.kind === 'dir';
+              const posixMode = formatPosixMode(item.kind, item.mode);
               return (
                 <div
                   key={item.id}
-                  onDoubleClick={() => isFolder ? handleOpenFolder(item.id) : handleOpenInVisualizer(item)}
+                  onDoubleClick={() => isFolder ? handleOpenFolder(item.name) : handleOpenInVisualizer(item)}
                   className="group relative bg-white border border-slate-200/80 hover:border-indigo-500/40 rounded-2xl p-4 shadow-sm hover:shadow-md transition-all flex flex-col justify-between cursor-pointer"
                 >
                   <div className="flex items-start justify-between mb-3">
@@ -786,20 +549,28 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
                       {getItemIcon(item)}
                     </div>
                     
-                    {/* Visualizer Quick Action */}
-                    {!isFolder && (
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleOpenInVisualizer(item);
-                        }}
-                        className="px-2 py-1 rounded-lg bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-[10px] font-bold flex items-center space-x-1 opacity-0 group-hover:opacity-100 transition-opacity"
-                        title="Open in Visualizer Tab"
-                      >
-                        <ExternalLink className="w-3 h-3" />
-                        <span>Visualize</span>
-                      </button>
-                    )}
+                    <div className="flex items-center space-x-1">
+                      {item.sealed && (
+                        <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-amber-50 text-amber-700 border border-amber-200 flex items-center">
+                          <Lock className="w-2.5 h-2.5 mr-0.5 text-amber-600" />
+                          Sealed
+                        </span>
+                      )}
+
+                      {!isFolder && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleOpenInVisualizer(item);
+                          }}
+                          className="px-2 py-1 rounded-lg bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-[10px] font-bold flex items-center space-x-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                          title="Open in Visualizer Tab"
+                        >
+                          <ExternalLink className="w-3 h-3" />
+                          <span>Open</span>
+                        </button>
+                      )}
+                    </div>
                   </div>
 
                   <div>
@@ -807,31 +578,20 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
                       {item.name}
                     </h4>
                     <div className="flex items-center justify-between text-[10px] text-slate-400 font-mono">
-                      <span>{isFolder ? 'Folder' : item.size ? `${(item.size / 1024).toFixed(1)} KB` : 'System File'}</span>
-                      <span>{new Date(item.updated_at).toLocaleDateString()}</span>
+                      <span>{posixMode}</span>
+                      <span>{isFolder ? 'dir' : item.size ? `${(item.size / 1024).toFixed(1)} KB` : '0 B'}</span>
                     </div>
                   </div>
 
                   {/* Context Actions */}
-                  <div className="mt-3 pt-3 border-t border-slate-100 flex items-center justify-between text-[11px] text-slate-500">
-                    <span className="truncate max-w-[100px] text-[10px]">{item.created_by}</span>
+                  <div className="mt-3 pt-3 border-t border-slate-100 flex items-center justify-between text-[11px] text-slate-500 font-mono">
+                    <span className="truncate max-w-[120px] text-[10px] text-slate-400">{item.owner}:{item.gid}</span>
                     <div className="flex items-center space-x-1">
-                      {item.url && (
-                        <a
-                          href={item.url}
-                          download={item.name}
-                          onClick={(e) => e.stopPropagation()}
-                          className="p-1 hover:text-slate-900 rounded"
-                          title="Download"
-                        >
-                          <Download className="w-3 h-3" />
-                        </a>
-                      )}
                       {!isFolder && (
                         <button
                           onClick={(e) => {
                             e.stopPropagation();
-                            setPreviewFile(item);
+                            handlePreview(item);
                           }}
                           className="p-1 hover:text-slate-900 rounded"
                           title="Inspect File"
@@ -839,7 +599,7 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
                           <Eye className="w-3 h-3" />
                         </button>
                       )}
-                      {isAdmin && !item.id.startsWith('chat_file_') && (
+                      {isAdmin && (
                         <button
                           onClick={(e) => {
                             e.stopPropagation();
@@ -861,23 +621,29 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
       </div>
 
       {/* File Preview Modal */}
-      {previewFile && (
+      {previewContent && (
         <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="bg-white rounded-3xl w-full max-w-3xl max-h-[85vh] flex flex-col overflow-hidden shadow-2xl border border-slate-100">
             <div className="p-4 bg-slate-900 text-white flex items-center justify-between">
               <div className="flex items-center space-x-2">
-                {getItemIcon(previewFile)}
-                <span className="font-bold text-xs font-mono">{previewFile.name}</span>
+                <FileCode className="w-4 h-4 text-emerald-400" />
+                <span className="font-bold text-xs font-mono">{previewContent.name}</span>
               </div>
               <div className="flex items-center space-x-2">
-                <button
-                  onClick={() => handleOpenInVisualizer(previewFile)}
-                  className="px-2.5 py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold flex items-center space-x-1"
-                >
-                  <ExternalLink className="w-3 h-3" />
-                  <span>Open in Visualizer</span>
-                </button>
-                <button onClick={() => setPreviewFile(null)} className="p-1 text-slate-400 hover:text-white">
+                {previewContent.inode && (
+                  <button
+                    onClick={() => {
+                      const inod = previewContent.inode!;
+                      setPreviewContent(null);
+                      handleOpenInVisualizer(inod);
+                    }}
+                    className="px-2.5 py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold flex items-center space-x-1"
+                  >
+                    <ExternalLink className="w-3 h-3" />
+                    <span>Open in Visualizer</span>
+                  </button>
+                )}
+                <button onClick={() => setPreviewContent(null)} className="p-1 text-slate-400 hover:text-white">
                   <X className="w-4 h-4" />
                 </button>
               </div>
@@ -885,7 +651,7 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
 
             <div className="flex-1 p-6 overflow-auto bg-slate-950 text-slate-200 font-mono text-xs">
               <pre className="whitespace-pre-wrap break-words leading-relaxed">
-                {previewFile.content || 'Binary data or streaming asset stored in Cloudflare storage tier.'}
+                {previewContent.content}
               </pre>
             </div>
           </div>
@@ -896,9 +662,9 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
       {showNewFileModal && (
         <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="bg-white rounded-3xl p-6 w-full max-w-lg shadow-2xl border border-slate-100">
-            <h3 className="text-base font-black text-slate-900 mb-1">Create New Code / Data File</h3>
+            <h3 className="text-base font-black text-slate-900 mb-1">Create New VFS File</h3>
             <p className="text-xs text-slate-500 mb-4">
-              Write scripts, configurations, or data files in the company&apos;s Linux filesystem.
+              Create a document, sheet, script, or configuration file in {currentVfsPath}.
             </p>
 
             <form onSubmit={handleCreateFile} className="space-y-4">
@@ -907,7 +673,7 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
                 <input
                   type="text"
                   required
-                  placeholder="e.g. script.py, data.csv, budget.sheet.json, notes.md"
+                  placeholder="e.g. notes.doc, budget.sheet, script.sh, config.toml"
                   value={newFileName}
                   onChange={(e) => setNewFileName(e.target.value)}
                   className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
@@ -916,10 +682,10 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
               </div>
 
               <div>
-                <label className="block text-xs font-bold text-slate-700 mb-1.5">Content</label>
+                <label className="block text-xs font-bold text-slate-700 mb-1.5">Initial Content</label>
                 <textarea
                   rows={8}
-                  placeholder="# Enter Python script, CSV records, JSON, or text..."
+                  placeholder="# Enter script, JSON, Markdown, or text..."
                   value={newFileContent}
                   onChange={(e) => setNewFileContent(e.target.value)}
                   className="w-full p-3 bg-slate-950 text-emerald-300 font-mono text-xs rounded-xl focus:outline-none"
@@ -938,7 +704,7 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
                   type="submit"
                   className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold rounded-xl shadow-md"
                 >
-                  Save & Mount File
+                  Create File
                 </button>
               </div>
             </form>
@@ -948,22 +714,27 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
 
       {/* New Folder Modal */}
       {showNewFolderModal && (
-        <div className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-white rounded-3xl p-6 w-full max-w-md shadow-2xl border border-slate-100">
+        <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl p-6 w-full max-w-sm shadow-2xl border border-slate-100">
             <h3 className="text-base font-black text-slate-900 mb-1">Create New Folder</h3>
+            <p className="text-xs text-slate-500 mb-4">
+              Create a new directory in {currentVfsPath}.
+            </p>
+
             <form onSubmit={handleCreateFolder} className="space-y-4">
               <div>
                 <label className="block text-xs font-bold text-slate-700 mb-1.5">Folder Name</label>
                 <input
                   type="text"
                   required
-                  placeholder="e.g. analytics, scripts, q4_reports"
+                  placeholder="e.g. sprint_q3, analytics, docs"
                   value={newFolderName}
                   onChange={(e) => setNewFolderName(e.target.value)}
-                  className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:outline-none"
+                  className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
                   autoFocus
                 />
               </div>
+
               <div className="flex items-center justify-end space-x-2 pt-2">
                 <button
                   type="button"
@@ -974,7 +745,7 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold rounded-xl shadow-md"
+                  className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold rounded-xl shadow-md"
                 >
                   Create Folder
                 </button>
@@ -984,7 +755,7 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
         </div>
       )}
 
-      {/* Confirm Action Modal */}
+      {/* Confirm Modal */}
       {confirmConfig && (
         <ConfirmModal
           isOpen={confirmConfig.isOpen}
@@ -994,7 +765,6 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
           onCancel={() => setConfirmConfig(null)}
         />
       )}
-
     </div>
   );
 };

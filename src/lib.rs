@@ -123,6 +123,7 @@ pub fn create_app(state: AppState) -> Router {
 
         // Asset API (Whiteboards, Sheets, Docs, PDFs)
         .route("/api/assets/save", post(save_asset_handler))
+        .route("/api/assets/delete", post(delete_asset_handler))
         .route("/api/assets/list", get(list_assets_handler))
 
         // Chat API
@@ -872,6 +873,32 @@ async fn list_assets_handler(
     (StatusCode::OK, Json(serde_json::json!({"success": true, "assets": assets})))
 }
 
+#[derive(Deserialize)]
+struct DeleteAssetReq {
+    token: String,
+    company_id: String,
+    id: String,
+}
+
+async fn delete_asset_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<DeleteAssetReq>,
+) -> impl IntoResponse {
+    let claims = match state.db.verify_token(&payload.token).await {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"success": false, "message": "Unauthorized"}))),
+    };
+
+    if !state.db.is_company_member(&claims.user_id, &payload.company_id) {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"success": false, "message": "Forbidden: not a member of this organization"})));
+    }
+
+    match state.db.delete_asset(&payload.company_id, &payload.id).await {
+        Ok(_) => (StatusCode::OK, Json(serde_json::json!({"success": true}))),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "message": e.to_string()}))),
+    }
+}
+
 
 // Chat & Passkey Handlers
 
@@ -935,26 +962,6 @@ async fn save_chat_msg_handler(
         Ok(s) => s,
         Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "message": e.to_string()}))),
     };
-
-    // Real-time disk persistence to /workspace/chats/<channel>.log
-    let workspace_chats = if std::path::Path::new("/workspace/chats").exists() {
-        "/workspace/chats".to_string()
-    } else {
-        std::env::current_dir()
-            .map(|p| p.join("workspace/chats").to_string_lossy().to_string())
-            .unwrap_or_else(|_| "/tmp/theysynced/workspace/chats".to_string())
-    };
-    let _ = std::fs::create_dir_all(&workspace_chats);
-
-    let clean_channel = payload.channel_id.to_lowercase().chars().map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect::<String>();
-    let clean_channel = if clean_channel.is_empty() { "general".to_string() } else { clean_channel };
-
-    let log_path = format!("{}/{}.log", workspace_chats, clean_channel);
-    use std::io::Write as _;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
-        let ts = saved.timestamp.replace('T', " ").chars().take(19).collect::<String>();
-        let _ = writeln!(f, "[{}] <{}> {}", ts, saved.username, saved.message);
-    }
 
     // If an active websocket session exists for this company, broadcast the message
     if let Some(session_entry) = state.sessions.get(&company_id) {

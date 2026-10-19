@@ -89,7 +89,7 @@ export interface WorkspaceAsset {
   id: string;
   company_id: string;
   team_id?: string;
-  asset_type: 'whiteboard' | 'spreadsheet' | 'doc' | 'pdf' | 'file' | 'folder';
+  asset_type: 'whiteboard' | 'spreadsheet' | 'doc' | 'pdf' | 'file' | 'folder' | 'task' | 'chat';
   name: string;
   content?: string;
   created_by: string;
