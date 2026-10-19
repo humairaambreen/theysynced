@@ -21,6 +21,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         db: Arc::new(db),
         sessions: Arc::new(DashMap::new()),
+        vfs_hub: Arc::new(theysynced::vfs::VfsHub::new()),
     };
 
     let cleanup_state = state.clone();

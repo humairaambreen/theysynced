@@ -20,6 +20,7 @@ pub mod session;
 pub mod openapi;
 pub mod crypto;
 pub mod ssrf;
+pub mod vfs;
 
 pub fn extract_token(headers: &axum::http::HeaderMap, query_or_body_token: Option<&str>) -> Option<String> {
     if let Some(auth) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
@@ -42,6 +43,7 @@ use utoipa_swagger_ui::SwaggerUi;
 pub struct AppState {
     pub db: Arc<Database>,
     pub sessions: Arc<DashMap<String, Session>>,
+    pub vfs_hub: Arc<vfs::VfsHub>,
 }
 
 #[utoipa::path(
@@ -72,6 +74,9 @@ async fn metrics_handler() -> impl IntoResponse {
 
 pub fn create_app(state: AppState) -> Router {
     Router::new()
+        // VFS Kernel API & Realtime WebSocket Hub
+        .merge(vfs::vfs_routes())
+
         // API Info (root)
         .route("/", get(index_handler))
 

@@ -228,6 +228,9 @@ pub struct Database {
     schema_title: Field,
     schema_category: Field,
     schema_body: Field,
+
+    // Virtual Filesystem Engine
+    pub vfs: Arc<crate::vfs::VfsEngine>,
 }
 
 impl Database {
@@ -300,6 +303,8 @@ impl Database {
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
             .try_into()?;
 
+        let vfs = Arc::new(crate::vfs::VfsEngine::new(turso.clone()));
+
         let instance = Self {
             jwt_secret,
             turso,
@@ -317,6 +322,7 @@ impl Database {
             schema_title,
             schema_category,
             schema_body,
+            vfs,
         };
 
         instance.init_schema().await?;
@@ -336,6 +342,75 @@ impl Database {
             CREATE TABLE IF NOT EXISTS ts_messages  (key TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS ts_passkeys  (user_id TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS ts_invites   (code TEXT PRIMARY KEY, data TEXT NOT NULL);
+
+            -- VFS Relational Schema
+            CREATE TABLE IF NOT EXISTS vfs_users (
+                company_id TEXT NOT NULL,
+                uid TEXT NOT NULL,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'human',
+                caps TEXT NOT NULL DEFAULT '[]',
+                home_inode TEXT NOT NULL,
+                PRIMARY KEY (company_id, uid)
+            );
+            CREATE TABLE IF NOT EXISTS vfs_groups (
+                company_id TEXT NOT NULL,
+                gid TEXT NOT NULL,
+                name TEXT NOT NULL,
+                PRIMARY KEY (company_id, gid)
+            );
+            CREATE TABLE IF NOT EXISTS vfs_group_members (
+                company_id TEXT NOT NULL,
+                gid TEXT NOT NULL,
+                uid TEXT NOT NULL,
+                PRIMARY KEY (company_id, gid, uid)
+            );
+            CREATE TABLE IF NOT EXISTS vfs_inodes (
+                company_id TEXT NOT NULL,
+                id TEXT NOT NULL,
+                parent_id TEXT,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                owner TEXT NOT NULL,
+                gid TEXT NOT NULL,
+                mode INTEGER NOT NULL,
+                sealed INTEGER NOT NULL DEFAULT 0,
+                size INTEGER NOT NULL DEFAULT 0,
+                mtime TEXT NOT NULL,
+                ctime TEXT NOT NULL,
+                blob_ref TEXT,
+                meta_json TEXT,
+                PRIMARY KEY (company_id, id),
+                UNIQUE (company_id, parent_id, name)
+            );
+            CREATE TABLE IF NOT EXISTS vfs_acl (
+                company_id TEXT NOT NULL,
+                inode_id TEXT NOT NULL,
+                uid TEXT NOT NULL,
+                perms INTEGER NOT NULL,
+                PRIMARY KEY (company_id, inode_id, uid)
+            );
+            CREATE TABLE IF NOT EXISTS vfs_messages (
+                company_id TEXT NOT NULL,
+                id TEXT NOT NULL,
+                chat_inode_id TEXT NOT NULL,
+                sender_uid TEXT NOT NULL,
+                ts TEXT NOT NULL,
+                body_encrypted TEXT NOT NULL,
+                PRIMARY KEY (company_id, id)
+            );
+            CREATE TABLE IF NOT EXISTS vfs_audit (
+                company_id TEXT NOT NULL,
+                ts TEXT NOT NULL,
+                uid TEXT NOT NULL,
+                op TEXT NOT NULL,
+                inode_id TEXT,
+                allowed INTEGER NOT NULL,
+                detail TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_vfs_inodes_parent ON vfs_inodes (company_id, parent_id);
+            CREATE INDEX IF NOT EXISTS idx_vfs_messages_chat ON vfs_messages (company_id, chat_inode_id, ts);
+            CREATE INDEX IF NOT EXISTS idx_vfs_audit_company ON vfs_audit (company_id, ts);
         ";
         self.turso.execute_batch(ddl).await
             .map(|_| ())
@@ -665,6 +740,7 @@ impl Database {
         results
     }
 
+    #[allow(dead_code)]
     async fn seed_default_workspace(&self) {
         // No default company seeded — every user creates or joins their own company
     }
@@ -1023,6 +1099,14 @@ impl Database {
         if let Some(entry) = self.users.iter().find(|e| e.value().id == owner_id) {
             self.upsert_user(entry.key(), entry.value()).await;
         }
+
+        // Initialize per-company VFS standard layout (/etc, /home, /chats, /projects, /var/log/audit, /tmp, /proc)
+        if let Err(e) = self.vfs.init_company_vfs(&company_id, owner_id, owner_username).await {
+            tracing::error!("init_company_vfs failed: {:?}", e);
+            eprintln!("init_company_vfs failed: {:?}", e);
+            return Err(anyhow!("init_company_vfs failed: {:?}", e));
+        }
+
         Ok(self.enrich_company(company))
     }
 
@@ -1108,6 +1192,31 @@ impl Database {
             }
 
             let comp_to_return = final_comp.unwrap_or(company);
+            self.upsert_company(&comp_id, &comp_to_return).await;
+
+            // Register joining user in company VFS
+            let user_home_ino = format!("home_{}", user_id);
+            let _ = self.turso.execute(
+                "INSERT OR IGNORE INTO vfs_users (company_id, uid, name, kind, caps, home_inode) VALUES (?, ?, ?, 'human', '[\"member\"]', ?)",
+                libsql::params![comp_id.clone(), user_id, username, user_home_ino.clone()],
+            ).await;
+            let _ = self.turso.execute(
+                "INSERT OR IGNORE INTO vfs_group_members (company_id, gid, uid) VALUES (?, 'everyone', ?)",
+                libsql::params![comp_id.clone(), user_id],
+            ).await;
+            let now_utc = chrono::Utc::now().to_rfc3339();
+            let _ = self.turso.execute(
+                "INSERT OR IGNORE INTO vfs_inodes (company_id, id, parent_id, name, kind, owner, gid, mode, sealed, size, mtime, ctime, blob_ref, meta_json)
+                 VALUES (?, ?, 'dir_home', ?, 'dir', ?, ?, ?, 0, 0, ?, ?, NULL, NULL)",
+                libsql::params![comp_id.clone(), user_home_ino.clone(), user_id, user_id, user_id, 0o700 as i64, now_utc.clone(), now_utc.clone()],
+            ).await;
+            let user_dms_ino = format!("dir_dms_{}", user_id);
+            let _ = self.turso.execute(
+                "INSERT OR IGNORE INTO vfs_inodes (company_id, id, parent_id, name, kind, owner, gid, mode, sealed, size, mtime, ctime, blob_ref, meta_json)
+                 VALUES (?, ?, ?, 'dms', 'dir', ?, ?, ?, 0, 0, ?, ?, NULL, NULL)",
+                libsql::params![comp_id.clone(), user_dms_ino, user_home_ino, user_id, user_id, 0o700 as i64, now_utc.clone(), now_utc],
+            ).await;
+
             Ok(self.enrich_company(comp_to_return))
         } else {
             Err(anyhow!("Invalid or expired company join code or OTP passcode"))
@@ -2020,5 +2129,34 @@ impl Database {
         }
         Ok(profile)
     }
+
+    pub async fn get_user_vfs_cred(&self, company_id: &str, user_id: &str) -> Option<crate::vfs::Cred> {
+        if !self.is_company_member(user_id, company_id) {
+            return None;
+        }
+        let is_admin = self.is_company_admin_or_owner(user_id, company_id);
+        let mut gids = vec!["everyone".to_string()];
+        if is_admin {
+            gids.push("admin".to_string());
+        }
+        if let Ok(mut rows) = self.turso.query(
+            "SELECT gid FROM vfs_group_members WHERE company_id = ? AND uid = ?",
+            libsql::params![company_id, user_id],
+        ).await {
+            while let Ok(Some(row)) = rows.next().await {
+                if let Ok(gid) = row.get::<String>(0) {
+                    if !gids.contains(&gid) {
+                        gids.push(gid);
+                    }
+                }
+            }
+        }
+        Some(crate::vfs::Cred::new(company_id, user_id, gids, is_admin))
+    }
+
+    pub fn get_user_by_id(&self, user_id: &str) -> Option<UserProfile> {
+        self.users.iter().find(|e| e.value().id == user_id).map(|e| e.value().clone())
+    }
 }
+
 
