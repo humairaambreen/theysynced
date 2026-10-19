@@ -1,37 +1,22 @@
 #:schema node_modules/wrangler/config-schema.json
-name = "app"
+name = "theysynced-edge"
 main = "worker/index.js"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
-account_id = "395409fcfde51c16e6058635b518fb3a"
 
-# ── Cloudflare Free Tier Cron Triggers ──────────────────────────────────────
-# Hourly background sweeper for 3-month (90 days) inactivity auto-purge policy
+# ── Cloudflare Cron Triggers ────────────────────────────────────────────────
+# Hourly trigger for 90-day inactivity sweeper (delegates to Rust backend)
 [triggers]
 crons = ["0 * * * *"]
 
-# ── Cloudflare Static Assets (Free Tier) ────────────────────────────────────
-# Serves WebRDP WASM packages, frontend UI, icons, and assets directly at edge
+# ── Cloudflare Static Assets ────────────────────────────────────────────────
+# Serves static assets, Next.js SPA export, and public files at edge
 [assets]
 directory = "./out"
 binding = "ASSETS"
 
-# ── Cloudflare D1 Serverless SQLite Database (100% Free Forever) ────────────
-# 5M reads/day, 100,000 writes/day, 5 GB storage
-[[d1_databases]]
-binding = "theysynced_db"
-database_name = "theysynced-db"
-database_id = "7238313c-499a-4ff9-a7be-ee32829206c5"
-
-# ── Cloudflare KV / Storage for Chat Files & Media ─────────────────────────
-# 100,000 reads/day, 1 GB storage, zero egress fees
-[[kv_namespaces]]
-binding = "theysynced_media"
-id = "299351d2c8f64d7d8d452567f96dd716"
-
 # ── Environment Variables ──────────────────────────────────────────────────
+# BACKEND_URL must be configured via environment or secret:
+# e.g., wrangler secret put BACKEND_URL
 [vars]
 RUST_LOG = "info"
-BACKEND_URL = "https://reminder-replacing-operates-segments.trycloudflare.com"
-
-

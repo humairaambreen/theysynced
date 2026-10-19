@@ -19,6 +19,17 @@ pub mod database;
 pub mod session;
 pub mod openapi;
 pub mod crypto;
+pub mod ssrf;
+
+pub fn extract_token(headers: &axum::http::HeaderMap, query_or_body_token: Option<&str>) -> Option<String> {
+    if let Some(auth) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
+        if let Some(token) = auth.strip_prefix("Bearer ") {
+            return Some(token.trim().to_string());
+        }
+        return Some(auth.trim().to_string());
+    }
+    query_or_body_token.map(|t| t.trim().to_string()).filter(|s| !s.is_empty())
+}
 
 use database::{Database, SearchQueryReq, WorkspaceAsset, CompanyRole};
 
@@ -133,6 +144,9 @@ pub fn create_app(state: AppState) -> Router {
         .route("/api/storage/upload", post(upload_storage_handler))
         .route("/api/storage/file/:key/:filename", get(get_storage_file_handler))
         .nest_service("/uploads", ServeDir::new("public/uploads"))
+
+        // Cron trigger API (invoked by edge worker or external scheduler)
+        .route("/api/cron/purge-inactive", post(purge_inactive_cron_handler))
 
         // Static Assets Service (Next.js / Frontend builds & SPA fallback)
         .nest_service("/pkg", ServeDir::new("public/pkg"))
@@ -642,10 +656,14 @@ async fn touch_company_activity_handler(
     State(state): State<AppState>,
     Json(payload): Json<TouchActivityReq>,
 ) -> impl IntoResponse {
-    let _claims = match state.db.verify_token(&payload.token).await {
+    let claims = match state.db.verify_token(&payload.token).await {
         Ok(c) => c,
         Err(_) => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"success": false, "message": "Unauthorized"}))),
     };
+
+    if !state.db.is_company_member(&claims.user_id, &payload.company_id) {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"success": false, "message": "Forbidden: user does not belong to this organization"})));
+    }
 
     state.db.touch_company_activity(&payload.company_id).await;
     (StatusCode::OK, Json(serde_json::json!({"success": true, "message": "Activity touched"})))
@@ -732,10 +750,14 @@ async fn create_team_handler(
     State(state): State<AppState>,
     Json(payload): Json<CreateTeamReq>,
 ) -> impl IntoResponse {
-    let _claims = match state.db.verify_token(&payload.token).await {
+    let claims = match state.db.verify_token(&payload.token).await {
         Ok(c) => c,
         Err(_) => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"success": false, "message": "Unauthorized"}))),
     };
+
+    if !state.db.is_company_member(&claims.user_id, &payload.company_id) {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"success": false, "message": "Forbidden: user does not belong to this organization"})));
+    }
 
     match state.db.create_team(&payload.company_id, &payload.name, &payload.description).await {
         Ok(team) => (StatusCode::OK, Json(serde_json::json!({"success": true, "team": team}))),
@@ -754,10 +776,14 @@ async fn delete_team_handler(
     State(state): State<AppState>,
     Json(payload): Json<DeleteTeamReq>,
 ) -> impl IntoResponse {
-    let _claims = match state.db.verify_token(&payload.token).await {
+    let claims = match state.db.verify_token(&payload.token).await {
         Ok(c) => c,
         Err(_) => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"success": false, "message": "Unauthorized"}))),
     };
+
+    if !state.db.is_company_admin_or_owner(&claims.user_id, &payload.company_id) {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"success": false, "message": "Forbidden: only owners or admins can delete teams"})));
+    }
 
     let _ = state.db.delete_team(&payload.company_id, &payload.team_id).await;
     (StatusCode::OK, Json(serde_json::json!({"success": true})))
@@ -774,10 +800,14 @@ async fn list_teams_handler(
     State(state): State<AppState>,
     Query(query): Query<ListTeamsQuery>,
 ) -> impl IntoResponse {
-    let _claims = match state.db.verify_token(&query.token).await {
+    let claims = match state.db.verify_token(&query.token).await {
         Ok(c) => c,
         Err(_) => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"success": false, "teams": []}))),
     };
+
+    if !state.db.is_company_member(&claims.user_id, &query.company_id) {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"success": false, "message": "Forbidden: not a member of this organization", "teams": []})));
+    }
 
     let teams = state.db.get_teams(&query.company_id).await;
     (StatusCode::OK, Json(serde_json::json!({"success": true, "teams": teams})))
@@ -795,10 +825,18 @@ async fn save_asset_handler(
     State(state): State<AppState>,
     Json(payload): Json<SaveAssetReq>,
 ) -> impl IntoResponse {
-    let _claims = match state.db.verify_token(&payload.token).await {
+    let claims = match state.db.verify_token(&payload.token).await {
         Ok(c) => c,
         Err(_) => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"success": false, "message": "Unauthorized"}))),
     };
+
+    if !state.db.is_company_member(&claims.user_id, &payload.company_id) {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"success": false, "message": "Forbidden: not a member of this organization"})));
+    }
+
+    if payload.asset.company_id != payload.company_id {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "message": "Mismatched asset company_id"})));
+    }
 
     match state.db.save_asset(&payload.company_id, payload.asset).await {
         Ok(asset) => (StatusCode::OK, Json(serde_json::json!({"success": true, "asset": asset}))),
@@ -816,10 +854,14 @@ async fn list_assets_handler(
     State(state): State<AppState>,
     Query(query): Query<ListAssetsQuery>,
 ) -> impl IntoResponse {
-    let _claims = match state.db.verify_token(&query.token).await {
+    let claims = match state.db.verify_token(&query.token).await {
         Ok(c) => c,
         Err(_) => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"success": false, "assets": []}))),
     };
+
+    if !state.db.is_company_member(&claims.user_id, &query.company_id) {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"success": false, "message": "Forbidden: not a member of this organization", "assets": []})));
+    }
 
     let assets = state.db.get_assets(&query.company_id).await;
     (StatusCode::OK, Json(serde_json::json!({"success": true, "assets": assets})))
@@ -853,6 +895,10 @@ async fn save_chat_msg_handler(
             payload.channel_id.clone()
         }
     });
+
+    if !state.db.is_company_member(&claims.user_id, &company_id) {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"success": false, "message": "Forbidden: not a member of this organization"})));
+    }
 
     let team_id = if payload.channel_id != company_id {
         Some(payload.channel_id.clone())
@@ -942,16 +988,29 @@ async fn save_chat_msg_handler(
 struct ListChatMsgsQuery {
     token: String,
     channel_id: String,
+    company_id: Option<String>,
 }
 
 async fn list_chat_msgs_handler(
     State(state): State<AppState>,
     Query(query): Query<ListChatMsgsQuery>,
 ) -> impl IntoResponse {
-    let _claims = match state.db.verify_token(&query.token).await {
+    let claims = match state.db.verify_token(&query.token).await {
         Ok(c) => c,
         Err(_) => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"success": false, "messages": []}))),
     };
+
+    let company_id = query.company_id.unwrap_or_else(|| {
+        if query.channel_id.starts_with("team_") && query.channel_id.ends_with("_gen") {
+            query.channel_id.trim_start_matches("team_").trim_end_matches("_gen").to_string()
+        } else {
+            query.channel_id.clone()
+        }
+    });
+
+    if !state.db.is_company_member(&claims.user_id, &company_id) {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"success": false, "message": "Forbidden: not a member of this organization", "messages": []})));
+    }
 
     let messages = state.db.get_channel_messages(&query.channel_id).await;
     (StatusCode::OK, Json(serde_json::json!({"success": true, "messages": messages})))
@@ -1080,10 +1139,18 @@ async fn verify_passkey_handler(
 
 // Search Handler using Tantivy
 async fn search_handler(
-
     State(state): State<AppState>,
     Json(payload): Json<SearchQueryReq>,
 ) -> impl IntoResponse {
+    let claims = match state.db.verify_token(&payload.token).await {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"success": false, "message": "Unauthorized", "results": []}))),
+    };
+
+    if !state.db.is_company_member(&claims.user_id, &payload.company_id) {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"success": false, "message": "Forbidden: not a member of this organization", "results": []})));
+    }
+
     if payload.validate().is_err() {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "results": []})));
     }
@@ -1092,11 +1159,28 @@ async fn search_handler(
     (StatusCode::OK, Json(serde_json::json!({"success": true, "results": results})))
 }
 
+#[derive(Deserialize, Default)]
+struct RdpWsQuery {
+    token: Option<String>,
+}
+
 // WebSocket bridge for WebRDP proxy
 async fn rdp_websocket_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Query(query): Query<RdpWsQuery>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    ws.on_upgrade(handle_rdp_websocket)
+    let token = match extract_token(&headers, query.token.as_deref()) {
+        Some(t) => t,
+        None => return (StatusCode::UNAUTHORIZED, "Unauthorized: missing token").into_response(),
+    };
+
+    if state.db.verify_token(&token).await.is_err() {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized: invalid token").into_response();
+    }
+
+    ws.on_upgrade(handle_rdp_websocket).into_response()
 }
 
 async fn handle_rdp_websocket(client_socket: WebSocket) {
@@ -1174,227 +1258,36 @@ async fn handle_rdp_websocket(client_socket: WebSocket) {
     }
 }
 
-#[derive(Deserialize, Default)]
-struct TerminalQuery {
-    username: Option<String>,
-    cols: Option<u16>,
-    rows: Option<u16>,
-}
-
-// Real-time Native Linux / POSIX PTY Terminal WebSocket Bridge
-async fn terminal_pty_ws_handler(
-    ws: WebSocketUpgrade,
-    Query(query): Query<TerminalQuery>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_pty_terminal_websocket(socket, query))
-}
-
-async fn handle_pty_terminal_websocket(socket: WebSocket, query: TerminalQuery) {
-    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-    use std::io::{Read, Write};
-
-    let username = query.username.unwrap_or_else(|| "theysynced".to_string());
-    let clean_user: String = username.chars().filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect();
-    let clean_user = if clean_user.is_empty() { "theysynced".to_string() } else { clean_user };
-
-    // Set up dedicated home directory & workspace directories (support root /workspace or local workspace)
-    let workspace_path = if std::fs::create_dir_all("/workspace").is_ok() {
-        "/workspace".to_string()
-    } else {
-        let local_ws = std::env::current_dir()
-            .map(|p| p.join("workspace").to_string_lossy().to_string())
-            .unwrap_or_else(|_| "/tmp/theysynced/workspace".to_string());
-        let _ = std::fs::create_dir_all(&local_ws);
-        local_ws
-    };
-
-    for sub in &["chats", "docs", "spreadsheets", "drawings", "tasks", "files", "export"] {
-        let _ = std::fs::create_dir_all(format!("{}/{}", workspace_path, sub));
-    }
-
-    let home_dir = if std::fs::create_dir_all(format!("/home/{}", clean_user)).is_ok() {
-        format!("/home/{}", clean_user)
-    } else {
-        let fallback_home = format!("{}/home/{}", workspace_path, clean_user);
-        let _ = std::fs::create_dir_all(&fallback_home);
-        fallback_home
-    };
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(&home_dir) {
-            let mut perms = meta.permissions();
-            perms.set_mode(0o700);
-            let _ = std::fs::set_permissions(&home_dir, perms);
-        }
-    }
-
-    let cols = query.cols.unwrap_or(100).max(20);
-    let rows = query.rows.unwrap_or(30).max(10);
-
-    let pty_system = native_pty_system();
-    let pty_pair = match pty_system.openpty(PtySize {
-        rows,
-        cols,
-        pixel_width: 0,
-        pixel_height: 0,
-    }) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!("Failed to open PTY: {}", e);
-            return;
-        }
-    };
-
-    let shell_candidates = [
-        "/bin/fish",
-        "/usr/bin/fish",
-        "/usr/local/bin/fish",
-        "/opt/homebrew/bin/fish",
-        "/bin/bash",
-        "/usr/bin/bash",
-        "/bin/zsh",
-        "/bin/sh",
-    ];
-
-    let shell_path = shell_candidates
-        .iter()
-        .find(|&&p| std::path::Path::new(p).exists())
-        .copied()
-        .unwrap_or_else(|| {
-            if let Ok(sh) = std::env::var("SHELL") {
-                if std::path::Path::new(&sh).exists() {
-                    return Box::leak(sh.into_boxed_str());
-                }
-            }
-            "/bin/sh"
-        });
-
-    let mut cmd = CommandBuilder::new(shell_path);
-    cmd.env("USER", &clean_user);
-    cmd.env("HOME", &home_dir);
-    cmd.env("WORKSPACE", &workspace_path);
-    cmd.env("TERM", "xterm-256color");
-    cmd.env("SHELL", shell_path);
-    cmd.env("PS1", format!("[{}@theysynced \\W]\\$ ", clean_user));
-
-    let cwd = if std::path::Path::new(&home_dir).exists() {
-        &home_dir
-    } else if std::path::Path::new(&workspace_path).exists() {
-        &workspace_path
-    } else {
-        "/"
-    };
-    cmd.cwd(cwd);
-
-    let mut child = match pty_pair.slave.spawn_command(cmd) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!("Failed to spawn shell in PTY: {}", e);
-            return;
-        }
-    };
-
-    let mut reader = match pty_pair.master.try_clone_reader() {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("Failed to clone PTY reader: {}", e);
-            return;
-        }
-    };
-
-    let mut writer = match pty_pair.master.take_writer() {
-        Ok(w) => w,
-        Err(e) => {
-            tracing::error!("Failed to take PTY writer: {}", e);
-            return;
-        }
-    };
-
-    let master_mutex = Arc::new(std::sync::Mutex::new(pty_pair.master));
-    let master_for_resize = master_mutex.clone();
-
-    let (mut client_sink, mut client_read) = socket.split();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(200);
-
-    // Dedicated reader thread for the synchronous PTY stream
-    std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if tx.blocking_send(buf[..n].to_vec()).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    let ws_send_task = tokio::spawn(async move {
-        while let Some(data) = rx.recv().await {
-            if client_sink.send(Message::Binary(data)).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    let ws_recv_task = tokio::spawn(async move {
-        while let Some(Ok(msg)) = client_read.next().await {
-            match msg {
-                Message::Text(txt) => {
-                    // Handle dynamic resize if message is JSON {"type":"resize","cols":...,"rows":...}
-                    if txt.starts_with(r#"{"type":"resize""#) {
-                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&txt) {
-                            if let (Some(c), Some(r)) = (
-                                val.get("cols").and_then(|v| v.as_u64()),
-                                val.get("rows").and_then(|v| v.as_u64()),
-                            ) {
-                                if let Ok(master) = master_for_resize.lock() {
-                                    let _ = master.resize(PtySize {
-                                        cols: c as u16,
-                                        rows: r as u16,
-                                        pixel_width: 0,
-                                        pixel_height: 0,
-                                    });
-                                }
-                                continue;
-                            }
-                        }
-                    }
-                    let _ = writer.write_all(txt.as_bytes());
-                    let _ = writer.flush();
-                }
-                Message::Binary(bin) => {
-                    let _ = writer.write_all(&bin);
-                    let _ = writer.flush();
-                }
-                Message::Close(_) => break,
-                _ => {}
-            }
-        }
-    });
-
-    tokio::select! {
-        _ = ws_send_task => {},
-        _ = ws_recv_task => {},
-    }
-
-    let _ = child.kill();
+// Direct host PTY terminal is disabled for security until Phase 4 isolated sandbox replaces it
+async fn terminal_pty_ws_handler() -> impl IntoResponse {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::CONTENT_TYPE, "text/plain".to_string())],
+        "503 Service Unavailable: Direct host terminal PTY is disabled for security. Sandboxed per-company environments will be provisioned in Phase 4.".to_string(),
+    )
 }
 
 #[derive(Deserialize)]
 struct BrowserProxyQuery {
     url: Option<String>,
+    token: Option<String>,
 }
 
-// Sandboxed Privacy Edge Proxy for In-App Browser (Strips frame restrictions & protects client IP)
+// Sandboxed Privacy Edge Proxy for In-App Browser (Requires valid session + enforces strict SSRF protections)
 async fn browser_proxy_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Query(query): Query<BrowserProxyQuery>,
 ) -> impl IntoResponse {
+    let token = match extract_token(&headers, query.token.as_deref()) {
+        Some(t) => t,
+        None => return (StatusCode::UNAUTHORIZED, [(header::CONTENT_TYPE, "text/plain".to_string())], "Unauthorized: valid session token required".to_string()).into_response(),
+    };
+
+    if state.db.verify_token(&token).await.is_err() {
+        return (StatusCode::UNAUTHORIZED, [(header::CONTENT_TYPE, "text/plain".to_string())], "Unauthorized: invalid session token".to_string()).into_response();
+    }
+
     let target_url_str = match query.url {
         Some(u) if !u.trim().is_empty() => u.trim().to_string(),
         _ => return (StatusCode::BAD_REQUEST, [(header::CONTENT_TYPE, "text/plain".to_string())], "Missing url parameter".to_string()).into_response(),
@@ -1406,14 +1299,49 @@ async fn browser_proxy_handler(
         target_url_str
     };
 
-    let parsed_url = match reqwest::Url::parse(&full_url) {
-        Ok(u) => u,
-        Err(e) => return (StatusCode::BAD_REQUEST, [(header::CONTENT_TYPE, "text/plain".to_string())], format!("Invalid URL: {}", e)).into_response(),
+    let (parsed_url, safe_addr) = match ssrf::resolve_and_verify_url(&full_url).await {
+        Ok(res) => res,
+        Err(e) => {
+            return (
+                StatusCode::FORBIDDEN,
+                [(header::CONTENT_TYPE, "text/plain".to_string())],
+                format!("SSRF Blocked: {}", e),
+            ).into_response();
+        }
     };
+
+    let host_str = match parsed_url.host_str() {
+        Some(h) => h.to_string(),
+        None => return (StatusCode::BAD_REQUEST, [(header::CONTENT_TYPE, "text/plain".to_string())], "Missing host in URL".to_string()).into_response(),
+    };
+
+    // Custom redirect policy validating every hop against SSRF rules
+    let redirect_policy = reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 5 {
+            return attempt.error(ssrf::SsrfError::TooManyRedirects);
+        }
+        let scheme = attempt.url().scheme().to_string();
+        if scheme != "http" && scheme != "https" {
+            return attempt.error(ssrf::SsrfError::UnsupportedScheme(scheme));
+        }
+        if let Some(h) = attempt.url().host_str().map(|s| s.to_string()) {
+            if ssrf::is_host_blocked_by_name(&h) {
+                return attempt.error(ssrf::SsrfError::BlockedAddress(format!("Blocked redirect host: {}", h)));
+            }
+            if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+                if ssrf::is_ip_blocked(ip) {
+                    return attempt.error(ssrf::SsrfError::BlockedAddress(format!("Blocked redirect IP: {}", ip)));
+                }
+            }
+        }
+        attempt.follow()
+    });
 
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
-        .redirect(reqwest::redirect::Policy::limited(10))
+        .resolve(&host_str, safe_addr)
+        .redirect(redirect_policy)
+        .timeout(std::time::Duration::from_secs(10))
         .build();
 
     let client = match client {
@@ -1422,7 +1350,7 @@ async fn browser_proxy_handler(
     };
 
     match client.get(parsed_url.clone()).send().await {
-        Ok(resp) => {
+        Ok(mut resp) => {
             let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
             let content_type = resp.headers()
                 .get(reqwest::header::CONTENT_TYPE)
@@ -1430,60 +1358,107 @@ async fn browser_proxy_handler(
                 .unwrap_or("text/html")
                 .to_string();
 
-            if content_type.contains("text/html") {
-                match resp.text().await {
-                    Ok(mut html) => {
-                        let base_href = format!("{}://{}{}", parsed_url.scheme(), parsed_url.host_str().unwrap_or(""), parsed_url.path());
-                        let base_tag = format!("<base href=\"{}\">", base_href);
-                        if let Some(pos) = html.find("<head>") {
-                            html.insert_str(pos + 6, &base_tag);
-                        } else if let Some(pos) = html.find("<HEAD>") {
-                            html.insert_str(pos + 6, &base_tag);
-                        } else {
-                            html.insert_str(0, &base_tag);
-                        }
+            // Cap response size: 10MB
+            const MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
+            if let Some(content_len) = resp.content_length() {
+                if content_len as usize > MAX_RESPONSE_SIZE {
+                    return (StatusCode::PAYLOAD_TOO_LARGE, [(header::CONTENT_TYPE, "text/plain".to_string())], "Response body too large (exceeds 10MB limit)".to_string()).into_response();
+                }
+            }
 
-                        (
-                            status,
-                            [
-                                (header::CONTENT_TYPE, content_type),
-                                (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".to_string()),
-                                (header::CACHE_CONTROL, "no-cache".to_string()),
-                            ],
-                            html.into_bytes(),
-                        ).into_response()
+            let mut body_bytes = Vec::new();
+            loop {
+                match resp.chunk().await {
+                    Ok(Some(chunk)) => {
+                        if body_bytes.len() + chunk.len() > MAX_RESPONSE_SIZE {
+                            return (StatusCode::PAYLOAD_TOO_LARGE, [(header::CONTENT_TYPE, "text/plain".to_string())], "Response body too large (exceeds 10MB limit)".to_string()).into_response();
+                        }
+                        body_bytes.extend_from_slice(&chunk);
                     }
-                    Err(e) => (StatusCode::BAD_GATEWAY, [(header::CONTENT_TYPE, "text/plain".to_string())], format!("Text error: {}", e).into_bytes()).into_response(),
+                    Ok(None) => break,
+                    Err(e) => {
+                        return (StatusCode::BAD_GATEWAY, [(header::CONTENT_TYPE, "text/plain".to_string())], format!("Stream read error: {}", e)).into_response();
+                    }
                 }
+            }
+
+            if content_type.contains("text/html") {
+                let mut html = String::from_utf8_lossy(&body_bytes).to_string();
+                let base_href = format!("{}://{}{}", parsed_url.scheme(), parsed_url.host_str().unwrap_or(""), parsed_url.path());
+                let base_tag = format!("<base href=\"{}\">", base_href);
+                if let Some(pos) = html.find("<head>") {
+                    html.insert_str(pos + 6, &base_tag);
+                } else if let Some(pos) = html.find("<HEAD>") {
+                    html.insert_str(pos + 6, &base_tag);
+                } else {
+                    html.insert_str(0, &base_tag);
+                }
+
+                (
+                    status,
+                    [
+                        (header::CONTENT_TYPE, content_type),
+                        (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".to_string()),
+                        (header::CACHE_CONTROL, "no-cache".to_string()),
+                    ],
+                    html.into_bytes(),
+                ).into_response()
             } else {
-                match resp.bytes().await {
-                    Ok(bytes) => (
-                        status,
-                        [
-                            (header::CONTENT_TYPE, content_type),
-                            (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".to_string()),
-                            (header::CACHE_CONTROL, "no-cache".to_string()),
-                        ],
-                        bytes.to_vec(),
-                    ).into_response(),
-                    Err(e) => (StatusCode::BAD_GATEWAY, [(header::CONTENT_TYPE, "text/plain".to_string())], format!("Fetch error: {}", e).into_bytes()).into_response(),
-                }
+                (
+                    status,
+                    [
+                        (header::CONTENT_TYPE, content_type),
+                        (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".to_string()),
+                        (header::CACHE_CONTROL, "no-cache".to_string()),
+                    ],
+                    body_bytes,
+                ).into_response()
             }
         }
         Err(e) => (StatusCode::BAD_GATEWAY, [(header::CONTENT_TYPE, "text/plain".to_string())], format!("Failed to fetch upstream: {}", e).into_bytes()).into_response(),
     }
 }
 
+#[derive(Deserialize, Default)]
+struct WsQuery {
+    token: Option<String>,
+}
+
 // WebSocket real-time engine
 async fn websocket_handler(
     ws: WebSocketUpgrade,
     Path(session_id): Path<String>,
+    Query(query): Query<WsQuery>,
+    headers: axum::http::HeaderMap,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_websocket(socket, session_id, state))
+    let token_opt = extract_token(&headers, query.token.as_deref());
+    let initial_claims = match token_opt {
+        Some(ref t) => {
+            match state.db.verify_token(t).await {
+                Ok(c) => {
+                    if !state.db.is_company_member(&c.user_id, &session_id) {
+                        return (StatusCode::FORBIDDEN, "Forbidden: user does not belong to this organization").into_response();
+                    }
+                    Some(c)
+                }
+                Err(_) => {
+                    return (StatusCode::UNAUTHORIZED, "Unauthorized: invalid session token").into_response();
+                }
+            }
+        }
+        None => None,
+    };
+
+    ws.on_upgrade(move |socket| handle_websocket(socket, session_id, state, initial_claims)).into_response()
 }
 
-async fn handle_websocket(socket: WebSocket, session_id: String, state: AppState) {
+async fn handle_websocket(
+    socket: WebSocket,
+    session_id: String,
+    state: AppState,
+    initial_claims: Option<database::TokenClaims>,
+) {
     let session = {
         if !state.sessions.contains_key(&session_id) {
             let (tx, _) = broadcast::channel(200);
@@ -1571,15 +1546,18 @@ async fn handle_websocket(socket: WebSocket, session_id: String, state: AppState
         state.sessions.get(&session_id).unwrap().value().clone()
     };
 
-
-
     session.user_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     let (mut sender, mut receiver) = socket.split();
     let mut rx = session.broadcast.subscribe();
 
-    let client_user_id = Arc::new(tokio::sync::RwLock::new(Uuid::new_v4().to_string()));
-    let client_username = Arc::new(tokio::sync::RwLock::new("Member".to_string()));
+    let authenticated = Arc::new(tokio::sync::RwLock::new(initial_claims.is_some()));
+    let client_user_id = Arc::new(tokio::sync::RwLock::new(
+        initial_claims.as_ref().map(|c| c.user_id.clone()).unwrap_or_default()
+    ));
+    let client_username = Arc::new(tokio::sync::RwLock::new(
+        initial_claims.as_ref().map(|c| c.username.clone()).unwrap_or_default()
+    ));
 
     {
         let current_state = session.state.read().await;
@@ -1593,6 +1571,7 @@ async fn handle_websocket(socket: WebSocket, session_id: String, state: AppState
     let session_clone = session.clone();
     let client_uid_clone = client_user_id.clone();
     let client_uname_clone = client_username.clone();
+    let auth_clone = authenticated.clone();
     let db_clone = state.db.clone();
 
     let mut send_task = tokio::spawn(async move {
@@ -1605,24 +1584,47 @@ async fn handle_websocket(socket: WebSocket, session_id: String, state: AppState
 
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(Message::Text(text))) = receiver.next().await {
-
             if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&text) {
                 let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
+                // Enforce verified authentication on WebSocket session
+                let is_auth = *auth_clone.read().await;
+                if !is_auth {
+                    if msg_type == "join" {
+                        let token = msg.get("token").and_then(|t| t.as_str()).unwrap_or("");
+                        match db_clone.verify_token(token).await {
+                            Ok(claims) => {
+                                if !db_clone.is_company_member(&claims.user_id, &session_clone.company_id) {
+                                    break;
+                                }
+                                *auth_clone.write().await = true;
+                                *client_uid_clone.write().await = claims.user_id.clone();
+                                *client_uname_clone.write().await = claims.username.clone();
+                                let broadcast_join = serde_json::json!({
+                                    "type": "user_joined",
+                                    "user_id": claims.user_id,
+                                    "username": claims.username
+                                });
+                                let _ = session_clone.broadcast.send(broadcast_join.to_string());
+                                continue;
+                            }
+                            Err(_) => {
+                                break;
+                            }
+                        }
+                    } else {
+                        break;
+                    }
+                }
+
                 match msg_type {
                     "join" => {
-                        if let Some(uid) = msg.get("user_id").and_then(|u| u.as_str()) {
-                            let mut u_id = client_uid_clone.write().await;
-                            *u_id = uid.to_string();
-                        }
-                        if let Some(name) = msg.get("username").and_then(|n| n.as_str()) {
-                            let mut u_name = client_uname_clone.write().await;
-                            *u_name = name.to_string();
-                        }
+                        let uid = client_uid_clone.read().await.clone();
+                        let uname = client_uname_clone.read().await.clone();
                         let broadcast_join = serde_json::json!({
                             "type": "user_joined",
-                            "user_id": *client_uid_clone.read().await,
-                            "username": *client_uname_clone.read().await
+                            "user_id": uid,
+                            "username": uname
                         });
                         let _ = session_clone.broadcast.send(broadcast_join.to_string());
                     }
@@ -1871,16 +1873,20 @@ async fn handle_websocket(socket: WebSocket, session_id: String, state: AppState
     }
 
     session.user_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    let uid = client_user_id.read().await.clone();
-    {
-        let mut st = session.state.write().await;
-        st.active_call_participants.remove(&uid);
+    if *authenticated.read().await {
+        let uid = client_user_id.read().await.clone();
+        if !uid.is_empty() {
+            {
+                let mut st = session.state.write().await;
+                st.active_call_participants.remove(&uid);
+            }
+            let leave_msg = serde_json::json!({
+                "type": "user_left",
+                "user_id": uid
+            });
+            let _ = session.broadcast.send(leave_msg.to_string());
+        }
     }
-    let leave_msg = serde_json::json!({
-        "type": "user_left",
-        "user_id": uid
-    });
-    let _ = session.broadcast.send(leave_msg.to_string());
 }
 
 #[derive(Debug, Deserialize)]
@@ -1917,10 +1923,14 @@ async fn list_invites_handler(
     State(state): State<AppState>,
     Query(payload): Query<ListInvitesReq>,
 ) -> impl IntoResponse {
-    let _ = match state.db.verify_token(&payload.token).await {
-        Ok(claims) => claims.user_id,
+    let claims = match state.db.verify_token(&payload.token).await {
+        Ok(c) => c,
         Err(_) => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"success": false, "error": "Invalid token"}))),
     };
+
+    if !state.db.is_company_admin_or_owner(&claims.user_id, &payload.company_id) {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"success": false, "error": "Forbidden: only owners or admins can list invites", "invites": []})));
+    }
 
     let invites = state.db.get_company_invites(&payload.company_id).await;
     (StatusCode::OK, Json(serde_json::json!({"success": true, "invites": invites})))
@@ -1973,6 +1983,8 @@ async fn join_invite_handler(
 
 #[derive(Deserialize)]
 pub struct StorageUploadReq {
+    pub token: Option<String>,
+    pub company_id: Option<String>,
     pub name: String,
     pub file_type: String,
     pub data_base64: String,
@@ -1988,8 +2000,26 @@ pub struct StorageUploadRes {
 }
 
 async fn upload_storage_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(payload): Json<StorageUploadReq>,
 ) -> impl IntoResponse {
+    let token = match extract_token(&headers, payload.token.as_deref()) {
+        Some(t) => t,
+        None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"success": false, "error": "Unauthorized: missing token"}))).into_response(),
+    };
+
+    let claims = match state.db.verify_token(&token).await {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"success": false, "error": "Unauthorized: invalid token"}))).into_response(),
+    };
+
+    if let Some(ref cid) = payload.company_id {
+        if !state.db.is_company_member(&claims.user_id, cid) {
+            return (StatusCode::FORBIDDEN, Json(serde_json::json!({"success": false, "error": "Forbidden: user does not belong to this organization"}))).into_response();
+        }
+    }
+
     use base64::Engine;
     let b64_clean = if let Some(pos) = payload.data_base64.find(',') {
         &payload.data_base64[pos + 1..]
@@ -2056,6 +2086,22 @@ async fn get_storage_file_handler(
         }
         Err(_) => (StatusCode::NOT_FOUND, "File not found").into_response(),
     }
+}
+
+async fn purge_inactive_cron_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if let Ok(cron_secret) = std::env::var("CRON_SECRET") {
+        let auth_hdr = headers.get("authorization").and_then(|h| h.to_str().ok());
+        let expected = format!("Bearer {}", cron_secret);
+        if auth_hdr != Some(&expected) {
+            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"success": false, "error": "Unauthorized cron trigger"}))).into_response();
+        }
+    }
+
+    run_inactivity_sweeper_tick(&state.db, &state.sessions).await;
+    (StatusCode::OK, Json(serde_json::json!({"success": true, "message": "Purge sweeper executed successfully"}))).into_response()
 }
 
 

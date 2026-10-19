@@ -18,6 +18,7 @@ interface ChatViewProps {
   selectedTeamId?: string;
   onSelectTeam?: (teamId: string) => void;
   websocket?: WebSocket | null;
+  token?: string;
 }
 
 const getRelativePresenceStatus = (lastActiveAt?: string) => {
@@ -61,6 +62,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
   selectedTeamId,
   onSelectTeam,
   websocket,
+  token,
 }) => {
   const [selectedTeam, setSelectedTeam] = useState<Team | null>(null);
   const [tick, setTick] = useState(0);
@@ -304,10 +306,17 @@ export const ChatView: React.FC<ChatViewProps> = ({
       });
 
       try {
+        const effectiveToken = token || (typeof window !== 'undefined' ? localStorage.getItem('theysynced_token') : null);
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (effectiveToken) {
+          headers['Authorization'] = `Bearer ${effectiveToken}`;
+        }
         const uploadRes = await fetch('/api/storage/upload', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers,
           body: JSON.stringify({
+            token: effectiveToken,
+            company_id: company.id,
             name: file.name,
             file_type: file.type || 'application/octet-stream',
             data_base64: b64,

@@ -518,7 +518,8 @@ export default function App() {
     if (!activeCompany || !user) return;
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws/${activeCompany.id}`;
+    const wsTokenParam = token ? `?token=${encodeURIComponent(token)}` : '';
+    const wsUrl = `${protocol}//${window.location.host}/ws/${activeCompany.id}${wsTokenParam}`;
 
     const ws = new WebSocket(wsUrl);
 
@@ -528,6 +529,7 @@ export default function App() {
           type: 'join',
           user_id: user.id,
           username: user.username,
+          token: token || undefined,
         })
       );
     };
@@ -1073,6 +1075,7 @@ export default function App() {
               selectedTeamId={activeTeamId}
               onSelectTeam={(teamId) => { setActiveTeamId(teamId); syncUrl('teams', teamId); }}
               websocket={websocket}
+              token={token || undefined}
             />
           )}
 
@@ -1087,6 +1090,7 @@ export default function App() {
               onDeleteAsset={handleDeleteAsset}
               onRefreshAssets={() => token && fetchAssets(token, activeCompany.id)}
               onNavigateTab={handleNavigateTab}
+              token={token || undefined}
             />
           )}
 
@@ -1123,6 +1127,7 @@ export default function App() {
             <BrowserView
               user={user}
               company={activeCompany}
+              token={token || undefined}
               initialUrl={browserInitialUrl}
               onNavigateTab={handleNavigateTab}
             />

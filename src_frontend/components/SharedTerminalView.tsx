@@ -233,11 +233,19 @@ ln -sf /bin/pacman /bin/apk 2>/dev/null
         const uname = encodeURIComponent(user?.username || 'user');
 
         const primaryWsUrl = `${wsProto}//${wsHost}/ws/terminal?username=${uname}&cols=${cols}&rows=${rows}`;
-        const tunnelWsUrl = `wss://reminder-replacing-operates-segments.trycloudflare.com/ws/terminal?username=${uname}&cols=${cols}&rows=${rows}`;
+        const envTunnel = process.env.NEXT_PUBLIC_TUNNEL_URL;
+        const tunnelWsUrl = envTunnel
+          ? `${envTunnel.replace(/^https:\/\//, 'wss://').replace(/^http:\/\//, 'ws://')}/ws/terminal?username=${uname}&cols=${cols}&rows=${rows}`
+          : '';
 
         let resolved = false;
 
         const attempt = (targetUrl: string, isFallback: boolean) => {
+          if (!targetUrl) {
+            resolved = true;
+            resolve(false);
+            return;
+          }
           try {
             const ws = new WebSocket(targetUrl);
             ws.binaryType = 'arraybuffer';
@@ -245,7 +253,7 @@ ln -sf /bin/pacman /bin/apk 2>/dev/null
             const timeout = setTimeout(() => {
               if (!resolved) {
                 try { ws.close(); } catch (_) {}
-                if (!isFallback && targetUrl !== tunnelWsUrl) {
+                if (!isFallback && tunnelWsUrl && targetUrl !== tunnelWsUrl) {
                   attempt(tunnelWsUrl, true);
                 } else {
                   resolved = true;

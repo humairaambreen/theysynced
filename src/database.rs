@@ -192,7 +192,7 @@ pub struct TokenClaims {
 
 #[derive(Debug, Deserialize, Validate)]
 pub struct SearchQueryReq {
-    #[allow(dead_code)]
+    pub token: String,
     pub company_id: String,
     #[validate(length(min = 1))]
     pub query: String,
@@ -1111,6 +1111,33 @@ impl Database {
             Ok(self.enrich_company(comp_to_return))
         } else {
             Err(anyhow!("Invalid or expired company join code or OTP passcode"))
+        }
+    }
+
+    pub fn is_company_member(&self, user_id: &str, company_id: &str) -> bool {
+        if let Some(comp) = self.companies.get(company_id) {
+            comp.owner_id == user_id || comp.member_ids.iter().any(|id| id == user_id) || comp.members.iter().any(|m| m.user_id == user_id)
+        } else {
+            false
+        }
+    }
+
+    pub fn get_member_role(&self, user_id: &str, company_id: &str) -> Option<CompanyRole> {
+        if let Some(comp) = self.companies.get(company_id) {
+            if comp.owner_id == user_id {
+                return Some(CompanyRole::Owner);
+            }
+            comp.members.iter().find(|m| m.user_id == user_id).map(|m| m.role.clone())
+        } else {
+            None
+        }
+    }
+
+    pub fn is_company_admin_or_owner(&self, user_id: &str, company_id: &str) -> bool {
+        if let Some(comp) = self.companies.get(company_id) {
+            comp.owner_id == user_id || comp.members.iter().any(|m| m.user_id == user_id && (m.role == CompanyRole::Owner || m.role == CompanyRole::Admin))
+        } else {
+            false
         }
     }
 

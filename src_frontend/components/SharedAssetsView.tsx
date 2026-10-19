@@ -22,6 +22,7 @@ interface SharedAssetsViewProps {
   onDeleteAsset: (assetId: string) => Promise<void>;
   onRefreshAssets?: () => void;
   onNavigateTab?: (tab: ActiveTab, subItem?: string) => void;
+  token?: string;
 }
 
 type FilterType = 'all' | 'images' | 'videos' | 'audio' | 'documents' | 'spreadsheets' | 'drawings' | 'chat';
@@ -36,6 +37,7 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
   onDeleteAsset,
   onRefreshAssets,
   onNavigateTab,
+  token,
 }) => {
   // Navigation State: Breadcrumb path of folder IDs / virtual path
   const [currentPath, setCurrentPath] = useState<string[]>(['root']);
@@ -504,10 +506,17 @@ export const SharedAssetsView: React.FC<SharedAssetsViewProps> = ({
           reader.readAsDataURL(file);
         });
 
+        const effectiveToken = token || (typeof window !== 'undefined' ? localStorage.getItem('theysynced_token') : null);
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (effectiveToken) {
+          headers['Authorization'] = `Bearer ${effectiveToken}`;
+        }
         const uploadRes = await fetch('/api/storage/upload', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers,
           body: JSON.stringify({
+            token: effectiveToken,
+            company_id: company.id,
             name: file.name,
             file_type: file.type || 'application/octet-stream',
             data_base64: base64Data,

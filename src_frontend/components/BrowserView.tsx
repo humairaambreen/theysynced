@@ -10,6 +10,7 @@ import { Company, UserProfile, ActiveTab } from '../types';
 interface BrowserViewProps {
   user: UserProfile;
   company: Company;
+  token?: string;
   initialUrl?: string;
   onNavigateTab?: (tab: ActiveTab, subItem?: string) => void;
 }
@@ -32,6 +33,7 @@ const DEFAULT_BOOKMARKS: BookmarkItem[] = [
 export const BrowserView: React.FC<BrowserViewProps> = ({
   user,
   company,
+  token,
   initialUrl = 'https://www.google.com/search?igu=1',
   onNavigateTab,
 }) => {
@@ -100,7 +102,9 @@ export const BrowserView: React.FC<BrowserViewProps> = ({
     }
 
     // Route through privacy edge proxy to strip X-Frame-Options and mask device IP
-    return `/api/browser/proxy?url=${encodeURIComponent(target)}`;
+    const effectiveToken = token || (typeof window !== 'undefined' ? localStorage.getItem('theysynced_token') : null);
+    const tokenParam = effectiveToken ? `&token=${encodeURIComponent(effectiveToken)}` : '';
+    return `/api/browser/proxy?url=${encodeURIComponent(target)}${tokenParam}`;
   };
 
   // Navigate to Target URL
