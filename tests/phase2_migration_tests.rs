@@ -19,6 +19,7 @@ async fn setup_phase2_test_db() -> Arc<Database> {
         db: db.clone(),
         sessions: Arc::new(DashMap::new()),
         vfs_hub,
+        cookie_jar: Arc::new(DashMap::new()),
     };
     let _app = create_app(state);
     db

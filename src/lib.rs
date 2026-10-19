@@ -22,6 +22,7 @@ pub mod crypto;
 pub mod ssrf;
 pub mod vfs;
 pub mod terminal;
+pub mod browser_proxy;
 
 pub fn extract_token(headers: &axum::http::HeaderMap, query_or_body_token: Option<&str>) -> Option<String> {
     if let Some(auth) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
@@ -45,6 +46,7 @@ pub struct AppState {
     pub db: Arc<Database>,
     pub sessions: Arc<DashMap<String, Session>>,
     pub vfs_hub: Arc<vfs::VfsHub>,
+    pub cookie_jar: Arc<DashMap<(String, String), Vec<String>>>,
 }
 
 #[utoipa::path(
@@ -146,7 +148,7 @@ pub fn create_app(state: AppState) -> Router {
         .route("/rdp-ws", get(rdp_websocket_handler))
         .route("/api/terminal/config", get(terminal::terminal_config_handler))
         .route("/ws/terminal", get(terminal::terminal_ws_handler))
-        .route("/api/browser/proxy", get(browser_proxy_handler))
+        .route("/api/browser/proxy", get(browser_proxy::browser_proxy_handler))
 
         // Storage / Media API (Cloudflare R2 & Local fallback)
         .route("/api/storage/upload", post(upload_storage_handler))
@@ -1273,158 +1275,6 @@ async fn handle_rdp_websocket(client_socket: WebSocket) {
 }
 
 
-
-#[derive(Deserialize)]
-struct BrowserProxyQuery {
-    url: Option<String>,
-    token: Option<String>,
-}
-
-// Sandboxed Privacy Edge Proxy for In-App Browser (Requires valid session + enforces strict SSRF protections)
-async fn browser_proxy_handler(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-    Query(query): Query<BrowserProxyQuery>,
-) -> impl IntoResponse {
-    let token = match extract_token(&headers, query.token.as_deref()) {
-        Some(t) => t,
-        None => return (StatusCode::UNAUTHORIZED, [(header::CONTENT_TYPE, "text/plain".to_string())], "Unauthorized: valid session token required".to_string()).into_response(),
-    };
-
-    if state.db.verify_token(&token).await.is_err() {
-        return (StatusCode::UNAUTHORIZED, [(header::CONTENT_TYPE, "text/plain".to_string())], "Unauthorized: invalid session token".to_string()).into_response();
-    }
-
-    let target_url_str = match query.url {
-        Some(u) if !u.trim().is_empty() => u.trim().to_string(),
-        _ => return (StatusCode::BAD_REQUEST, [(header::CONTENT_TYPE, "text/plain".to_string())], "Missing url parameter".to_string()).into_response(),
-    };
-
-    let full_url = if !target_url_str.starts_with("http://") && !target_url_str.starts_with("https://") {
-        format!("https://{}", target_url_str)
-    } else {
-        target_url_str
-    };
-
-    let (parsed_url, safe_addr) = match ssrf::resolve_and_verify_url(&full_url).await {
-        Ok(res) => res,
-        Err(e) => {
-            return (
-                StatusCode::FORBIDDEN,
-                [(header::CONTENT_TYPE, "text/plain".to_string())],
-                format!("SSRF Blocked: {}", e),
-            ).into_response();
-        }
-    };
-
-    let host_str = match parsed_url.host_str() {
-        Some(h) => h.to_string(),
-        None => return (StatusCode::BAD_REQUEST, [(header::CONTENT_TYPE, "text/plain".to_string())], "Missing host in URL".to_string()).into_response(),
-    };
-
-    // Custom redirect policy validating every hop against SSRF rules
-    let redirect_policy = reqwest::redirect::Policy::custom(|attempt| {
-        if attempt.previous().len() >= 5 {
-            return attempt.error(ssrf::SsrfError::TooManyRedirects);
-        }
-        let scheme = attempt.url().scheme().to_string();
-        if scheme != "http" && scheme != "https" {
-            return attempt.error(ssrf::SsrfError::UnsupportedScheme(scheme));
-        }
-        if let Some(h) = attempt.url().host_str().map(|s| s.to_string()) {
-            if ssrf::is_host_blocked_by_name(&h) {
-                return attempt.error(ssrf::SsrfError::BlockedAddress(format!("Blocked redirect host: {}", h)));
-            }
-            if let Ok(ip) = h.parse::<std::net::IpAddr>() {
-                if ssrf::is_ip_blocked(ip) {
-                    return attempt.error(ssrf::SsrfError::BlockedAddress(format!("Blocked redirect IP: {}", ip)));
-                }
-            }
-        }
-        attempt.follow()
-    });
-
-    let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
-        .resolve(&host_str, safe_addr)
-        .redirect(redirect_policy)
-        .timeout(std::time::Duration::from_secs(10))
-        .build();
-
-    let client = match client {
-        Ok(c) => c,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, [(header::CONTENT_TYPE, "text/plain".to_string())], format!("Client init error: {}", e)).into_response(),
-    };
-
-    match client.get(parsed_url.clone()).send().await {
-        Ok(mut resp) => {
-            let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
-            let content_type = resp.headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("text/html")
-                .to_string();
-
-            // Cap response size: 10MB
-            const MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
-            if let Some(content_len) = resp.content_length() {
-                if content_len as usize > MAX_RESPONSE_SIZE {
-                    return (StatusCode::PAYLOAD_TOO_LARGE, [(header::CONTENT_TYPE, "text/plain".to_string())], "Response body too large (exceeds 10MB limit)".to_string()).into_response();
-                }
-            }
-
-            let mut body_bytes = Vec::new();
-            loop {
-                match resp.chunk().await {
-                    Ok(Some(chunk)) => {
-                        if body_bytes.len() + chunk.len() > MAX_RESPONSE_SIZE {
-                            return (StatusCode::PAYLOAD_TOO_LARGE, [(header::CONTENT_TYPE, "text/plain".to_string())], "Response body too large (exceeds 10MB limit)".to_string()).into_response();
-                        }
-                        body_bytes.extend_from_slice(&chunk);
-                    }
-                    Ok(None) => break,
-                    Err(e) => {
-                        return (StatusCode::BAD_GATEWAY, [(header::CONTENT_TYPE, "text/plain".to_string())], format!("Stream read error: {}", e)).into_response();
-                    }
-                }
-            }
-
-            if content_type.contains("text/html") {
-                let mut html = String::from_utf8_lossy(&body_bytes).to_string();
-                let base_href = format!("{}://{}{}", parsed_url.scheme(), parsed_url.host_str().unwrap_or(""), parsed_url.path());
-                let base_tag = format!("<base href=\"{}\">", base_href);
-                if let Some(pos) = html.find("<head>") {
-                    html.insert_str(pos + 6, &base_tag);
-                } else if let Some(pos) = html.find("<HEAD>") {
-                    html.insert_str(pos + 6, &base_tag);
-                } else {
-                    html.insert_str(0, &base_tag);
-                }
-
-                (
-                    status,
-                    [
-                        (header::CONTENT_TYPE, content_type),
-                        (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".to_string()),
-                        (header::CACHE_CONTROL, "no-cache".to_string()),
-                    ],
-                    html.into_bytes(),
-                ).into_response()
-            } else {
-                (
-                    status,
-                    [
-                        (header::CONTENT_TYPE, content_type),
-                        (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".to_string()),
-                        (header::CACHE_CONTROL, "no-cache".to_string()),
-                    ],
-                    body_bytes,
-                ).into_response()
-            }
-        }
-        Err(e) => (StatusCode::BAD_GATEWAY, [(header::CONTENT_TYPE, "text/plain".to_string())], format!("Failed to fetch upstream: {}", e).into_bytes()).into_response(),
-    }
-}
 
 #[derive(Deserialize, Default)]
 struct WsQuery {

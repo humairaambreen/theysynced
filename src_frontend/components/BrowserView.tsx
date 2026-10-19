@@ -107,6 +107,22 @@ export const BrowserView: React.FC<BrowserViewProps> = ({
     return `/api/browser/proxy?url=${encodeURIComponent(target)}${tokenParam}`;
   };
 
+  const loadTimeoutRef = useRef<any>(null);
+
+  const startWatchdog = () => {
+    if (loadTimeoutRef.current) clearTimeout(loadTimeoutRef.current);
+    loadTimeoutRef.current = setTimeout(() => {
+      setIsLoading(false);
+      setLoadError(true);
+    }, 10000);
+  };
+
+  const handleIframeLoaded = () => {
+    if (loadTimeoutRef.current) clearTimeout(loadTimeoutRef.current);
+    setIsLoading(false);
+    setLoadError(false);
+  };
+
   // Navigate to Target URL
   const navigateTo = (targetUrl: string) => {
     const cleanUrl = normalizeUrl(targetUrl);
@@ -114,6 +130,7 @@ export const BrowserView: React.FC<BrowserViewProps> = ({
     setCurrentUrl(cleanUrl);
     setLoadError(false);
     setIsLoading(true);
+    startWatchdog();
 
     const nextHistory = history.slice(0, historyIndex + 1);
     nextHistory.push(cleanUrl);
@@ -130,6 +147,7 @@ export const BrowserView: React.FC<BrowserViewProps> = ({
       setCurrentUrl(url);
       setLoadError(false);
       setIsLoading(true);
+      startWatchdog();
     }
   };
 
@@ -142,18 +160,19 @@ export const BrowserView: React.FC<BrowserViewProps> = ({
       setCurrentUrl(url);
       setLoadError(false);
       setIsLoading(true);
+      startWatchdog();
     }
   };
 
   const handleReload = () => {
     setIsLoading(true);
     setLoadError(false);
+    startWatchdog();
     if (iframeRef.current) {
       try {
         iframeRef.current.src = getIframeUrl(currentUrl);
       } catch (_) {}
     }
-    setTimeout(() => setIsLoading(false), 800);
   };
 
   const handleGoHome = () => {
@@ -359,8 +378,9 @@ export const BrowserView: React.FC<BrowserViewProps> = ({
         <iframe
           ref={iframeRef}
           src={getIframeUrl(currentUrl)}
-          onLoad={() => setIsLoading(false)}
+          onLoad={handleIframeLoaded}
           onError={() => {
+            if (loadTimeoutRef.current) clearTimeout(loadTimeoutRef.current);
             setIsLoading(false);
             setLoadError(true);
           }}
@@ -371,14 +391,14 @@ export const BrowserView: React.FC<BrowserViewProps> = ({
 
         {/* Error Fallback */}
         {loadError && (
-          <div className="absolute inset-0 bg-[#0a0d14]/95 flex flex-col items-center justify-center p-6 text-center space-y-4 font-sans">
+          <div className="absolute inset-0 bg-[#0a0d14]/95 flex flex-col items-center justify-center p-6 text-center space-y-4 font-sans z-30">
             <div className="w-12 h-12 rounded-2xl bg-slate-800 border border-white/10 flex items-center justify-center text-slate-400">
               <Compass className="w-6 h-6 text-emerald-400" />
             </div>
-            <div className="max-w-md space-y-1">
-              <h3 className="text-sm font-bold text-white">Navigation Notice</h3>
+            <div className="max-w-md space-y-2">
+              <h3 className="text-sm font-bold text-white">Standalone Window Required</h3>
               <p className="text-xs text-slate-400 leading-relaxed">
-                Could not connect to target host via the sandboxed edge gateway.
+                This destination timed out or enforces strict anti-bot protection (e.g. Cloudflare Turnstile), DRM, or custom WebSockets that refuse in-frame proxying.
               </p>
             </div>
             <div className="flex items-center space-x-3">
@@ -386,14 +406,14 @@ export const BrowserView: React.FC<BrowserViewProps> = ({
                 onClick={() => window.open(currentUrl, '_blank', 'noopener,noreferrer')}
                 className="flex items-center space-x-1.5 px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold rounded-xl shadow transition"
               >
-                <span>Open in External Tab</span>
+                <span>Open in Standalone Window</span>
                 <ExternalLink className="w-3.5 h-3.5" />
               </button>
               <button
                 onClick={() => navigateTo('https://www.google.com')}
                 className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold rounded-xl border border-white/10 transition"
               >
-                Go to Google
+                Go to Google Search
               </button>
             </div>
           </div>

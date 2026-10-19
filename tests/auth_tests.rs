@@ -15,6 +15,7 @@ async fn setup_test_app() -> (axum::Router, Arc<Database>) {
         db: db.clone(),
         sessions: Arc::new(DashMap::new()),
         vfs_hub: Arc::new(theysynced::vfs::VfsHub::new()),
+        cookie_jar: Arc::new(DashMap::new()),
     };
     let app = create_app(state);
     (app, db)

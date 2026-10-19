@@ -22,6 +22,7 @@ async fn main() -> anyhow::Result<()> {
         db: Arc::new(db),
         sessions: Arc::new(DashMap::new()),
         vfs_hub: Arc::new(theysynced::vfs::VfsHub::new()),
+        cookie_jar: Arc::new(DashMap::new()),
     };
 
     let cleanup_state = state.clone();
